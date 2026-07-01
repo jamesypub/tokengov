@@ -1,0 +1,5 @@
+{
+  "story": ["type: feature", "feature request", "examples"],
+  "bug":   ["type: bug", "bug", "regression"],
+  "task":  ["documentation", "type: documentation", "type: chore"]
+}

@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  tg-cognito-pool: AWS Cognito User Pool + Hosted UI domain
+  + App Client + bootstrap admin user. Acts as an OIDC IdP
+  for the tg-admin SPA login flow when there is no Okta
+  tenant available (issue #184).
+
+  The User Pool exposes the standard OIDC discovery doc at
+  https://cognito-idp.<region>.amazonaws.com/<pool-id>/
+  .well-known/openid-configuration, so the existing
+  /auth/login + /auth/callback flow works unchanged.
+
+  Outputs the four values that go into TG_OIDC_*:
+    OidcIssuer       — Issuer URL
+    OidcClientId     — App Client ID
+    OidcClientSecret — App Client Secret
+    HostedUiDomain   — for reference (also computable)
+
+Parameters:
+  # #937: BootstrapAdminEmail was removed — the bootstrap admin is no
+  # longer a CFN resource (see the note where BootstrapUser used to be,
+  # below). The installer creates + CONFIRMs the admin idempotently via
+  # scripts/tg-cognito-bootstrap-pw.sh, so the pool template no longer
+  # needs the email.
+
+  CallbackUrl:
+    Type: String
+    Description: >
+      Full https/http URL the IdP redirects to after login.
+      Must match TG_OIDC_REDIRECT_URI on the api side.
+      e.g. http://tg-alb-xxx.us-east-1.elb.amazonaws.com/auth/callback
+      or http://localhost:8000/auth/callback for local dev.
+
+  LogoutUrl:
+    Type: String
+    Default: ''
+    Description: Optional sign-out redirect; defaults to CallbackUrl host root.
+
+  PoolName:
+    Type: String
+    Default: tg-admin-pool
+
+  DomainPrefix:
+    Type: String
+    Description: >
+      Hosted UI subdomain prefix; full URL becomes
+      https://<prefix>.auth.<region>.amazoncognito.com.
+      Must be globally unique within the region. Defaults
+      to tg-admin-<account>.
+
+    Default: ''
+
+  OktaMetadataUrl:
+    Type: String
+    Default: ''
+    Description: >
+      Optional bootstrap. Okta SAML app metadata URL (the
+      "Identity Provider metadata" link in Okta's app settings,
+      e.g. https://yourtenant.okta.com/app/<appid>/sso/saml/metadata).
+      When set, the pool registers Okta as a SAML IdP and
+      the App Client offers it alongside COGNITO. Leave empty
+      to keep username/password as the only login mode.
+      You no longer need this at install time: an org-admin can
+      configure (or change) the SAML IdP at runtime from
+      Settings -> Authentication with no redeploy. This param
+      seeds that runtime config on first boot for existing
+      installs; runtime config is authoritative thereafter.
+
+  OktaProviderName:
+    Type: String
+    Default: Okta
+    Description: >
+      Name shown in the Hosted UI picker and used when
+      bypassing the picker via /auth/login?identity_provider=
+      Must be alphanumeric, no spaces. Only used when
+      OktaMetadataUrl is set.
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9_.-]*$'
+
+  OktaEmailAttribute:
+    Type: String
+    Default: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress'
+    Description: >
+      SAML attribute name carrying the user's email. The
+      Okta default is the W3 schema URL above; override only
+      if your Okta app maps email under a different attribute.
+
+Conditions:
+  HasLogoutUrl: !Not [!Equals [!Ref LogoutUrl, '']]
+  DefaultDomainPrefix: !Equals [!Ref DomainPrefix, '']
+  HasOktaIdp: !Not [!Equals [!Ref OktaMetadataUrl, '']]
+
+Resources:
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Ref PoolName
+      # ESSENTIALS unlocks Managed Login (the brandable
+      # Hosted UI v2). LITE only supports the classic
+      # unbrandable chrome. (#193)
+      UserPoolTier: ESSENTIALS
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        InviteMessageTemplate:
+          EmailSubject: 'tg-admin: your login'
+          # #802: include the actual console sign-in URL instead of
+          # "the URL provided by your admin" — the invite is useless
+          # without it. The console base is CallbackUrl minus the
+          # /auth/callback suffix (Select 0 of Split on that suffix);
+          # visiting it 302s an unauthenticated user to the login.
+          # NOTE: Cognito's {username} / {####} placeholders have no
+          # '$', so they pass through !Sub untouched — only ${...} is
+          # substituted.
+          EmailMessage: !Sub
+            - |
+              You've been invited to the Token Governance
+              admin console.
+
+              Username: {username}
+              Temporary password: {####}
+
+              Sign in at: ${ConsoleUrl}
+              You'll be prompted to set a new password.
+            - ConsoleUrl: !Select [0, !Split ['/auth/callback', !Ref CallbackUrl]]
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      MfaConfiguration: 'OFF'
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !If
+        - DefaultDomainPrefix
+        - !Sub 'tg-admin-${AWS::AccountId}'
+        - !Ref DomainPrefix
+      # 2 = Managed Login (brandable). 1 = classic Hosted UI
+      # (no branding). #193 needs the v2 surface.
+      ManagedLoginVersion: 2
+
+  # Okta SAML IdP, conditional on OktaMetadataUrl. Maps the
+  # Okta `email` SAML attribute → Cognito's `email` standard
+  # attribute so the existing /auth/callback path picks up the
+  # email claim unchanged. ProviderName matches what the App
+  # Client lists, and what /auth/login can pass via
+  # ?identity_provider= to skip the Hosted UI picker.
+  OktaIdp:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Condition: HasOktaIdp
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: !Ref OktaProviderName
+      ProviderType: SAML
+      ProviderDetails:
+        MetadataURL: !Ref OktaMetadataUrl
+        IDPSignout: 'false'
+      AttributeMapping:
+        email: !Ref OktaEmailAttribute
+
+  AppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: tg-admin-spa
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      CallbackURLs:
+        - !Ref CallbackUrl
+      LogoutURLs: !If
+        - HasLogoutUrl
+        - [!Ref LogoutUrl]
+        - [!Ref CallbackUrl]
+      # When Okta is wired, the App Client must list BOTH —
+      # COGNITO keeps username/password working for the
+      # bootstrap admin path, OktaIdp adds the federated path.
+      # The !Ref OktaIdp here also creates the implicit
+      # CFN dependency so the IdP exists before the client
+      # references it.
+      SupportedIdentityProviders: !If
+        - HasOktaIdp
+        - [COGNITO, !Ref OktaIdp]
+        - [COGNITO]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # Per-app-client managed-login branding (#193). Cognito
+  # requires ClientId despite the CFN schema marking it
+  # optional — pool-level branding is not creatable via the
+  # CFN resource. UseCognitoProvidedValues=true picks up
+  # AWS's default branded chrome (Managed Login v2); when
+  # we want to swap to a custom dark+orange palette we'll
+  # supply Settings + Assets and drop UseCognitoProvidedValues
+  # (the two are mutually exclusive). Text/copy is NOT
+  # customizable on the Cognito side — the "Cost vs. Value"
+  # header lives on the SPA's /login page.
+  ManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientId: !Ref AppClient
+      UseCognitoProvidedValues: true
+
+  # #937: the bootstrap admin is NOT a CFN resource. AWS::Cognito::
+  # UserPoolUser is create-only with no AlreadyExists tolerance, so a
+  # pool UPDATE that merely reconciles the ALB callback URL re-creates
+  # the user and fails `User already exists` → UPDATE_ROLLBACK (it bit
+  # the #935 self-heal whenever the pool outlived a recreated container
+  # stack — the common case). Modelling it in CFN also means it would
+  # be DELETED if ever dropped from the template on an update
+  # (DeletionPolicy default = Delete). The installer creates it
+  # idempotently instead — tg_ensure_bootstrap_admin_user in
+  # scripts/tg-cognito-bootstrap-pw.sh, alongside the CONFIRMED-password
+  # step (#921). The BootstrapAdminEmail parameter was dropped with it
+  # (the installer holds the email).
+
+Outputs:
+
+  UserPoolId:
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  OidcIssuer:
+    Description: TG_OIDC_ISSUER value for the api task.
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+    Export:
+      Name: !Sub '${AWS::StackName}-OidcIssuer'
+
+  OidcClientId:
+    Description: TG_OIDC_CLIENT_ID value.
+    Value: !Ref AppClient
+    Export:
+      Name: !Sub '${AWS::StackName}-OidcClientId'
+
+  HostedUiDomain:
+    Description: Cognito Hosted UI base URL.
+    Value: !Sub
+      - 'https://${Domain}.auth.${AWS::Region}.amazoncognito.com'
+      - Domain: !If
+          - DefaultDomainPrefix
+          - !Sub 'tg-admin-${AWS::AccountId}'
+          - !Ref DomainPrefix
+
+  GetClientSecretCommand:
+    Description: |
+      Cognito doesn't expose the client secret as a CFN
+      output (security). Run this to print it:
+    Value: !Sub
+      - 'aws cognito-idp describe-user-pool-client --user-pool-id ${UserPool} --client-id ${AppClient} --query UserPoolClient.ClientSecret --output text'
+      - {}
+
+  OktaProviderName:
+    Description: >
+      Name to pass as ?identity_provider= on /auth/login to
+      skip the Hosted UI picker. Empty when Okta isn't wired.
+    Value: !If [HasOktaIdp, !Ref OktaProviderName, '']

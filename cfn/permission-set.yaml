@@ -1,0 +1,178 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IDC permission set for Token Governance:
+    - tg-Developer: invoke Claude via Bedrock CRIS / foundation
+      models. Assigned to the dev IDC group.
+  (#591/#566D: the tg-Admin permission set was removed — it only
+  chained into tg-BedrockAdmin, now deleted with the desktop
+  client. Admins use the web UI login.)
+
+  Plus the BedrockQuotaDeny scaffold (mutated by the deny
+  reconciler — keep at 1 shard for the pilot).
+
+  Deploy from the IAM Identity Center management account.
+  Optional: customers can manage IDC permission sets via
+  Terraform / Control Tower / a different account instead;
+  see INSTALL.md "Configure IDC permission sets" Path B for
+  the equivalent JSON.
+
+Parameters:
+  InstanceArn:
+    Type: String
+    Description: IDC instance ARN (aws sso-admin list-instances)
+    Default: arn:aws:sso:::instance/ssoins-72231453bd632d20
+
+  TargetAccountId:
+    Type: String
+    Description: AWS account to receive the permission set assignments
+    AllowedPattern: '^\d{12}$'
+
+  DeveloperGroupId:
+    Type: String
+    Description: >
+      IDC group ID assigned to tg-Developer (regular devs running
+      `claude` against Bedrock).
+
+  # #591 (#566D): AdminGroupId removed — the tg-Admin permission
+  # set it fed is gone (chained into the deleted tg-BedrockAdmin).
+
+  BedrockRegion:
+    Type: String
+    Description: Region where Bedrock invoke happens; used to scope CRIS ARNs
+    Default: us-east-1
+
+  SonnetProfileId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+
+  HaikuProfileId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+  OpusProfileId:
+    Type: String
+    Default: us.anthropic.claude-opus-4-7
+
+  SessionDuration:
+    Type: String
+    Description: ISO8601 duration for IDC session lifetime (PT1H, PT8H, PT12H, P7D)
+    Default: PT8H
+    AllowedValues: [PT1H, PT4H, PT8H, PT12H, P7D]
+
+  DenyPolicyShardCount:
+    Type: Number
+    Description: Number of BedrockQuotaDeny managed-policy shards (Step 2 only; keep 1 for pilot)
+    Default: 1
+    MinValue: 1
+    MaxValue: 9
+
+  IsOrgInstance:
+    Type: String
+    Description: >
+      'true' if IDC is an organization instance (supports CustomerManagedPolicyReferences
+      on AWS::SSO::PermissionSet), 'false' if it is an account instance (AWS blocks the
+      property on account instances - we must attach the Deny policy out-of-band).
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  AttachDenyViaPermissionSet: !Equals [!Ref IsOrgInstance, 'true']
+  # #591: HasDistinctAdminGroup removed with AdminGroupId / tg-Admin.
+
+Resources:
+  # ── tg-Developer ── narrow Bedrock-invoke perms ──────
+  DeveloperPermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Properties:
+      Name: tg-Developer
+      Description: Claude Code via Bedrock for pilot devs
+      InstanceArn: !Ref InstanceArn
+      SessionDuration: !Ref SessionDuration
+      CustomerManagedPolicyReferences:
+        !If
+          - AttachDenyViaPermissionSet
+          - - Name: BedrockQuotaDeny
+          - !Ref AWS::NoValue
+      InlinePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: BedrockInvokeCRIS
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource:
+              - !Sub arn:aws:bedrock:${BedrockRegion}:${TargetAccountId}:inference-profile/${SonnetProfileId}
+              - !Sub arn:aws:bedrock:${BedrockRegion}:${TargetAccountId}:inference-profile/${HaikuProfileId}
+              - !Sub arn:aws:bedrock:${BedrockRegion}:${TargetAccountId}:inference-profile/${OpusProfileId}
+          - Sid: BedrockInvokeFoundationModels
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource:
+              - !Sub arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-*
+              - !Sub arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-*
+              - !Sub arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-*
+          - Sid: BedrockReadOnly
+            Effect: Allow
+            Action:
+              - bedrock:ListFoundationModels
+              - bedrock:GetFoundationModel
+              - bedrock:ListInferenceProfiles
+              - bedrock:GetInferenceProfile
+            Resource: '*'
+
+  # #591 (#566D): the tg-Admin permission set is removed — its
+  # only action was sts:AssumeRole on tg-BedrockAdmin, and that
+  # role is deleted (desktop client gone, #574/#576). Admins reach
+  # the org_admin UI via the web login (Cognito/OIDC), not a
+  # role-chain. (This whole template is the deferred SSO-permission-
+  # set path — see CLAUDE.md; the live pilot uses the IAM-role path.)
+
+  BedrockQuotaDeny:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: BedrockQuotaDeny
+      Description: Target for quota reconciler Lambda (Step 2). Starts with no-op; reconciler appends per-(user, model) Deny statements. Do not edit manually.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: NoOpPlaceholder
+            Effect: Deny
+            Action: bedrock:InvokeModel
+            Resource: arn:aws:bedrock:us-east-1:123456789012:inference-profile/placeholder-never-matches
+
+  DeveloperGroupAssignment:
+    Type: AWS::SSO::Assignment
+    Properties:
+      InstanceArn: !Ref InstanceArn
+      PermissionSetArn: !GetAtt DeveloperPermissionSet.PermissionSetArn
+      PrincipalId: !Ref DeveloperGroupId
+      PrincipalType: GROUP
+      TargetId: !Ref TargetAccountId
+      TargetType: AWS_ACCOUNT
+
+  # #591 (#566D): AdminGroupAssignment removed with the tg-Admin
+  # permission set (it chained into the deleted tg-BedrockAdmin).
+
+Outputs:
+  DeveloperPermissionSetArn:
+    Value: !GetAtt DeveloperPermissionSet.PermissionSetArn
+    Description: Needed by Step 2 quota stack to attach BedrockQuotaDeny to the provisioned role
+    Export:
+      Name: !Sub ${AWS::StackName}-DeveloperPermissionSetArn
+
+  # #591: AdminPermissionSetArn output removed with tg-Admin.
+
+  QuotaDenyPolicyArn:
+    Value: !Ref BedrockQuotaDeny
+    Description: Reconciler Lambda target in Step 2
+    Export:
+      Name: !Sub ${AWS::StackName}-QuotaDenyPolicyArn
+
+  DeveloperGroupId:
+    Value: !Ref DeveloperGroupId
+    Description: Echo of the IDC group assigned to tg-Developer
+
+  # #591: AdminGroupId echo output removed with tg-Admin.

@@ -1,0 +1,13 @@
+# .dockerignore — keep the Docker build context small + deterministic.
+**/node_modules
+**/dist
+admin-ui/web/dist
+container/static
+.git
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+**/.DS_Store
+*.log
+.env*

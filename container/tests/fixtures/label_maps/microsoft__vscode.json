@@ -1,0 +1,5 @@
+{
+  "story": ["feature-request", "polish"],
+  "bug":   ["bug", "verification-needed"],
+  "task":  ["debt", "*duplicate", "info-needed"]
+}

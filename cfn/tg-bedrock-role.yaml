@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  tg-bedrock-role: common IAM role that users assume (via sts:AssumeRole or
+  Okta→SAML federation) to invoke Bedrock. Attaches tg-BedrockSharedPolicy
+  (allow-by-default: Bedrock invoke on ANY model/vendor/region/CRIS profile;
+  model restriction is the deny reconciler's block-list, the sole model gate)
+  and an empty tg-BedrockQuotaDeny managed policy that the quota reconciler
+  mutates at runtime. Replaces the previous AWS::SSO::PermissionSet design.
+
+Parameters:
+  # BedrockRegion was removed: the grant's Resource ARNs now use a
+  # region wildcard (any region), so there is no region to pin here.
+
+  TargetAccountId:
+    Type: String
+    Description: Account where this role lives; used to scope the inference-profile ARN
+    AllowedPattern: '^\d{12}$'
+
+  # The per-model Sonnet/Haiku/OpusProfileId parameters were removed:
+  # the base grant now allows ANY model (the reconciler's block-list is
+  # the sole model gate), so there are no per-model ARNs left to pin.
+  # (The identically-named params on tg-container-stack.yaml are a
+  # SEPARATE stack — the app's own task-role grant — and are unaffected.)
+
+  TrustedIamPrincipals:
+    Type: CommaDelimitedList
+    Description: >
+      IAM principals (users, roles) allowed to sts:AssumeRole this role.
+      Example: arn:aws:iam::<acct>:user/alice
+    Default: ''
+
+  # #590 (#566C): the tg-ApiRunner role + its
+  # ApiRunnerTrustedPrincipal / CurBucketName /
+  # AthenaResultsBucketName params were removed. The api now
+  # queries CUR/Athena under its own task role (tg-app); there
+  # is no separate runner role to trust or scope.
+
+  TrustedSamlProviderArn:
+    Type: String
+    Description: >
+      SAML provider ARN allowed to sts:AssumeRoleWithSAML this role.
+      Example: arn:aws:iam::<acct>:saml-provider/Okta
+      Leave empty if using IAM principals only.
+    Default: ''
+
+  TrustedSsoPrincipalArnLike:
+    Type: CommaDelimitedList
+    Description: >
+      OPTIONAL override of the SSO trust pattern. The SSO trust is now
+      UNCONDITIONAL — emitted on every deploy regardless of this param.
+      Leave EMPTY (the default) and the template trusts the
+      name-agnostic
+      arn:aws:iam::<acct>:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_*
+      — every permission set in the account, surviving IDC
+      re-provisioning (the AWSReservedSSO_<permset>_<suffix> hash
+      changes on re-provision). Set a value only to NARROW the trust to
+      specific permission set(s), e.g. AWSReservedSSO_<permset>_*. AWS
+      rejects a bare wildcard in Principal:AWS, so the SSO role is
+      trusted via Principal:AWS=<acct>:root + ArnLike on this pattern;
+      same-account scope is enforced by that root clause. Harmless on a
+      non-IDC account: the wildcard is in an ArnLike condition (not
+      Principal), so it is valid and simply never matches.
+    Default: ''
+
+  RequireSessionNameMatch:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      If 'true', require sts:RoleSessionName == ${aws:username}
+      on assume-role. Only meaningful for IAM-user trust (the
+      classic cred-process design); leave 'false' for role-chain
+      trust (assumed-role sessions, CI, EC2 instance profiles).
+  MaxSessionSeconds:
+    Type: Number
+    Default: 28800   # 8h
+    MinValue: 3600   # 1h
+    MaxValue: 43200  # 12h
+    Description: Max session length when assuming this role, in seconds
+
+Conditions:
+  HasIamPrincipals: !Not [!Equals [!Join ['', !Ref TrustedIamPrincipals], '']]
+  HasSamlProvider: !Not [!Equals [!Ref TrustedSamlProviderArn, '']]
+  HasSsoPrincipals: !Not [!Equals [!Join ['', !Ref TrustedSsoPrincipalArnLike], '']]
+  RequireSessionMatch: !Equals [!Ref RequireSessionNameMatch, 'true']
+
+Resources:
+  # ── Deny policy (empty-ish scaffold; mutated by tg-deny-reconciler) ────
+  BedrockQuotaDeny:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: tg-BedrockQuotaDeny
+      Description: Target for tg-deny-reconciler Lambda. Reconciler rewrites this at runtime. Do not hand-edit.
+      # #626: the reconciler rewrites this document each cycle.
+      # The scaffold ships the no-op placeholder (per-person
+      # quota class) plus the model-allowlist class as a
+      # commented shape in the reconciler — the live
+      # DenyNonApprovedModels statement is emitted at runtime
+      # only once an admin configures the approved-model list
+      # (PUT /settings/approved-models). A NotResource:[] here
+      # would Deny ALL models and lock everyone out, so the
+      # scaffold deliberately stays no-op until configured.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: NoOpPlaceholder
+            Effect: Deny
+            Action: bedrock:InvokeModel
+            Resource: arn:aws:bedrock:us-east-1:123456789012:inference-profile/placeholder-never-matches
+
+  # ── The common role users assume ────────────────────────────────────
+  TokenConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: tg-consumer
+      Description: Common role for Claude Code pilot devs. Assumed via STS by trusted principals.
+      MaxSessionDuration: !Ref MaxSessionSeconds
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # IAM-user/role assume-role path (for dev/test — session-name forced to username)
+          - !If
+              - HasIamPrincipals
+              - Effect: Allow
+                Principal:
+                  AWS: !Ref TrustedIamPrincipals
+                Action: sts:AssumeRole
+                Condition: !If
+                  - RequireSessionMatch
+                  - StringEquals:
+                      sts:RoleSessionName: ${aws:username}
+                  - !Ref AWS::NoValue
+              - !Ref AWS::NoValue
+          # SAML federation path (for Okta-backed prod)
+          - !If
+              - HasSamlProvider
+              - Effect: Allow
+                Principal:
+                  Federated: !Ref TrustedSamlProviderArn
+                Action: sts:AssumeRoleWithSAML
+                Condition:
+                  StringEquals:
+                    SAML:aud: https://signin.aws.amazon.com/saml
+              - !Ref AWS::NoValue
+          # IDC / SSO permission-set path. ALWAYS emitted (no gate on
+          # emission) — every deploy carries the name-agnostic SSO
+          # trust so a bare `aws cloudformation deploy` (or an upgrade
+          # that re-passes nothing) can't silently drop it. Owner
+          # decision: zero-config, principal-agnostic governance trusts
+          # every permission set in the account by default; a customer
+          # never has to know their permission-set name(s).
+          #
+          # Safe even on a non-IDC account: the AWSReservedSSO_* wildcard
+          # lives in an ArnLike CONDITION on aws:PrincipalArn, NOT in
+          # Principal. AWS forbids wildcards / nonexistent ARNs in
+          # Principal ("Invalid principal in policy") but a condition is
+          # a request-time string match that needs no existing role — so
+          # where IDC is absent the statement is valid and simply never
+          # matches (inert, not an error). Principal stays
+          # AWS=<acct>:root (always valid); same-account scope is
+          # enforced by that root clause, so the _* wildcard can't be
+          # assumed cross-account. The trailing _* also absorbs the IDC
+          # re-provisioning suffix, so trust survives permission-set
+          # churn.
+          #
+          # HasSsoPrincipals no longer gates EMISSION — only the ArnLike
+          # VALUE: an operator-supplied TrustedSsoPrincipalArnLike when
+          # non-empty, else the name-agnostic !Sub default (the param
+          # Default can't interpolate ${TargetAccountId}, so the default
+          # lives here in template logic).
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${TargetAccountId}:root
+            Action: sts:AssumeRole
+            Condition:
+              ArnLike:
+                aws:PrincipalArn: !If
+                  - HasSsoPrincipals
+                  - !Ref TrustedSsoPrincipalArnLike
+                  - !Sub arn:aws:iam::${TargetAccountId}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_*
+          # No bare account-root fallback statement: the SSO statement
+          # above is now always emitted, so the role always trusts at
+          # least the account root gated by the AWSReservedSSO_* ArnLike
+          # (plus any IAM/SAML statements when configured). The old
+          # "root-only if nothing else configured" fallback is therefore
+          # dead — it could only fire when HasSsoPrincipals was false,
+          # which no longer suppresses the SSO statement.
+      ManagedPolicyArns:
+        - !Ref BedrockQuotaDeny
+      Policies:
+        - PolicyName: tg-BedrockSharedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Allow-by-default: the base grant invokes ANY model — any
+              # vendor, any region, any CRIS profile (geo + global). Model
+              # restriction lives ENTIRELY in the reconciler's
+              # DenyBlockedModels statement (an explicit Deny overrides
+              # this broad Allow); an empty block-list means every model is
+              # allowed, including models AWS ships later. A model AWS
+              # launches tomorrow works with no template change.
+              #
+              # Invoking an inference profile requires Allow on BOTH the
+              # profile ARN AND the underlying foundation-model ARN, in the
+              # source region AND every destination region a profile fans
+              # out to; global CRIS additionally needs the region-less
+              # foundation-model form. The region wildcard (*) matches all
+              # current + future destination regions with no template
+              # churn; installs needing regional confinement use an SCP.
+              # Converse/ConverseStream are distinct IAM actions from
+              # InvokeModel* and must be granted too (the reconciler denies
+              # all four).
+              - Sid: BedrockInvokeAnyModel
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource:
+                  # inference profiles (geo + global), any region/model
+                  - !Sub arn:aws:bedrock:*:${TargetAccountId}:inference-profile/*
+                  # foundation models, source + destination regions
+                  - arn:aws:bedrock:*::foundation-model/*
+                  # region-less global-CRIS foundation-model form
+                  - arn:aws:bedrock:::foundation-model/*
+              - Sid: BedrockReadOnly
+                Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                Resource: '*'
+
+  # #590 (#566C): tg-ApiRunner deleted. The api container no
+  # longer assumes a dedicated CUR/Athena role — it queries
+  # under its own task role (tg-app, in tg-container-stack.yaml),
+  # which carries the AthenaCurQueries / GlueCatalogReadForCur /
+  # S3ReadForCurAndAthena perms directly. The Cognito-only-admin
+  # concern that motivated #358 is unchanged: queries run under
+  # the task role's identity, never the admin's host ~/.aws/.
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt TokenConsumerRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-RoleArn
+
+  RoleName:
+    Value: !Ref TokenConsumerRole
+    Export:
+      Name: !Sub ${AWS::StackName}-RoleName
+
+  QuotaDenyPolicyArn:
+    Value: !Ref BedrockQuotaDeny
+    Description: Managed-policy ARN; deny_reconciler writes versions here
+    Export:
+      Name: !Sub ${AWS::StackName}-QuotaDenyPolicyArn

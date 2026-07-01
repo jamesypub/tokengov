@@ -1,0 +1,260 @@
+/* login.css — branded /login landing card (cloud SPA) and the
+   matching DesktopAuthScreen on the tg-admin binary.
+
+   Both screens are framed by the same .tg-login-frame so the cloud
+   and desktop entry points read as the same product. */
+
+.tg-login-frame {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 32px 20px;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+}
+
+.tg-login-card {
+  width: 100%;
+  max-width: 560px;
+  padding: 44px 40px 36px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-md);
+}
+
+.tg-login-eyebrow {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+  margin-bottom: 18px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tg-login-eyebrow .dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.tg-login-h1 {
+  font-family: var(--display);
+  font-style: italic;
+  font-weight: 400;
+  font-size: 56px;
+  line-height: 0.96;
+  letter-spacing: -0.03em;
+  color: var(--ink);
+  margin-bottom: 14px;
+}
+
+.tg-login-lede {
+  font-family: var(--display);
+  font-style: italic;
+  font-size: 22px;
+  line-height: 1.4;
+  color: var(--ink-2);
+  margin-bottom: 28px;
+  letter-spacing: -0.005em;
+}
+.tg-login-lede em {
+  font-style: italic;
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--accent);
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 5px;
+}
+
+.tg-login-body {
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--ink-3);
+  margin-bottom: 22px;
+}
+.tg-login-body code {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  background: var(--surface-2);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--ink-2);
+}
+
+.tg-login-cta {
+  display: inline-block;
+  width: 100%;
+  background: var(--ink);
+  color: var(--surface);
+  border: none;
+  border-radius: var(--r-md);
+  padding: 13px 18px;
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.tg-login-cta:hover { background: var(--ink-2); }
+.tg-login-cta:disabled {
+  background: var(--ink-5);
+  cursor: wait;
+}
+
+.tg-login-cta-secondary {
+  display: inline-block;
+  width: 100%;
+  background: transparent;
+  color: var(--ink-2);
+  border: none;
+  padding: 8px 14px;
+  margin-top: 8px;
+  font-family: var(--sans);
+  font-size: 12.5px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  transition: color 0.15s ease;
+}
+.tg-login-cta-secondary:hover { color: var(--ink); }
+
+/* Break-glass recovery disclosure. The "Trouble signing in?" toggle is
+   a real <button aria-expanded> — style it as a visibly-interactive,
+   low-prominence link (underlined, pointer, hover/focus) so it reads as
+   clickable, not inert text. The revealed panel holds the org-admin
+   recovery copy + the COGNITO hand-off button. */
+.tg-login-recovery {
+  margin-top: 14px;
+  text-align: center;
+}
+.tg-login-recovery-toggle {
+  display: inline-block;
+  background: transparent;
+  border: none;
+  padding: 4px 6px;
+  font-family: var(--sans);
+  font-size: 12.5px;
+  color: var(--ink-3);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  transition: color 0.15s ease;
+}
+.tg-login-recovery-toggle:hover { color: var(--ink); }
+.tg-login-recovery-toggle:focus-visible {
+  outline: 2px solid var(--accent, #4f6bed);
+  outline-offset: 2px;
+  border-radius: var(--r-sm, 6px);
+}
+.tg-login-recovery-panel {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--line, #e5e7eb);
+  border-radius: var(--r-sm, 6px);
+  background: var(--surface, #fafafa);
+  text-align: left;
+}
+.tg-login-recovery-copy {
+  margin: 0 0 10px;
+  font-family: var(--sans);
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--ink-3);
+}
+
+.tg-login-alert {
+  padding: 11px 14px;
+  border-radius: var(--r-sm);
+  font-size: 13px;
+  margin-bottom: 20px;
+  font-family: var(--sans);
+}
+.tg-login-alert--info {
+  background: var(--amber-soft);
+  color: var(--amber);
+  border: 1px solid var(--amber-edge);
+}
+.tg-login-alert--err {
+  background: var(--red-soft);
+  color: var(--red);
+  border: 1px solid var(--red-edge);
+}
+
+.tg-login-foot {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--ink-4);
+  line-height: 1.55;
+}
+.tg-login-foot code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  background: var(--surface-2);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--ink-3);
+}
+
+/* Desktop binary: terminal command block. */
+.tg-login-cmd {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 14px;
+  background: var(--ink);
+  color: var(--green);
+  border-radius: var(--r-sm);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  margin: 14px 0 22px;
+}
+.tg-login-cmd code {
+  background: transparent;
+  padding: 0;
+  color: var(--green);
+}
+.tg-login-cmd button {
+  background: transparent;
+  color: var(--ink-5);
+  border: 1px solid var(--ink-3);
+  border-radius: 4px;
+  padding: 4px 9px;
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+.tg-login-cmd button:hover { color: var(--surface); border-color: var(--ink-5); }
+
+.tg-login-details {
+  margin-top: 18px;
+  font-family: var(--sans);
+}
+.tg-login-details summary {
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-4);
+  letter-spacing: 0.04em;
+}
+.tg-login-details pre {
+  font-family: var(--mono);
+  font-size: 11px;
+  margin-top: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--ink-4);
+}

@@ -1,0 +1,5 @@
+{
+  "story": ["Feature", "Suggestion", "API"],
+  "bug":   ["Bug", "Crash", "Regression"],
+  "task":  ["Docs", "Infrastructure", "Cleanup"]
+}

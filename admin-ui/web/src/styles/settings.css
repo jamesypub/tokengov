@@ -1,0 +1,38 @@
+/* settings.css — visual-polish pass for the Org Settings page.
+ *
+ * Owner feedback: the page had "so many lines around the boxes" — each
+ * section had a card border (rounded-xl) AND inner field-group boxes
+ * (rounded-lg border) AND row dividers all competing. This calms that:
+ * the section Card keeps the one strong container edge; inner groups
+ * drop to a hair line so they read from whitespace, not a box-in-box;
+ * stacked dividers collapse to one; sections get consistent rhythm.
+ *
+ * Scoped under `.tg-settings` (the OrgSettings root) so it cannot
+ * regress any other page. CSS only — no markup/logic change. Uses the
+ * existing token set (var(--line)/var(--border)); no new design
+ * language. a11y: only border color + spacing change — focus rings,
+ * button roles/variants, headings, and the scroll-spy are untouched
+ * (button borders are not matched by these selectors).
+ */
+
+/* Consistent vertical rhythm between stacked section cards. */
+.tg-settings .rounded-xl + .rounded-xl {
+  margin-top: 0.875rem;
+}
+
+/* Inner field-group / collapsible boxes inside a section Card carried
+ * a full `rounded-lg border` — a box inside a box. Soften their edge
+ * to a hair line so the section's own (rounded-xl) card edge is the
+ * only strong container and the inner grouping reads from whitespace.
+ * Buttons are `rounded`/`rounded-md`, not `rounded-lg`, so their
+ * borders are NOT affected. */
+.tg-settings .rounded-xl .rounded-lg.border,
+.tg-settings .rounded-xl [class~="rounded-lg"][class~="border"] {
+  border-color: color-mix(in srgb, var(--line) 50%, transparent);
+}
+
+/* Collapse stacked row dividers inside a section to one separation:
+ * a top-border divider immediately following another earns nothing. */
+.tg-settings .border-t + .border-t {
+  border-top-color: transparent;
+}

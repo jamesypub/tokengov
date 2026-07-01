@@ -1,0 +1,7 @@
+# tg CLI (#487) runtime deps.
+#
+# questionary powers the wizard's select/text/password prompts. It is
+# OPTIONAL: tg_cli/prompts.py degrades to plain input() if it isn't
+# installed (so `tg` runs anywhere), but the guided UX is much nicer
+# with it. Install with:  pip install -r scripts/python/requirements.txt
+questionary>=2.0,<3

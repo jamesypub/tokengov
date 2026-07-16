@@ -1,0 +1,38 @@
+# .gitignore — generic ignore patterns for the public repo.
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Node / frontend build
+**/node_modules/
+**/dist/
+admin-ui/build/
+admin-ui/web/node_modules/
+admin-ui/web/dist/
+
+# AWS SAM / CDK artifacts
+.aws-sam/
+cdk.out/
+
+# Local secrets / credentials — never commit these
+*.pem
+*.key
+credentials
+.env
+.env.local
+.env.*
+
+# Container static-bundle drop point (regenerated from the UI build)
+container/static/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.log

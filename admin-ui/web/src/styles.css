@@ -1,0 +1,60 @@
+/* #692: self-hosted fonts (was a cross-origin @import from
+   fonts.googleapis.com that the browser blocked via CORS preflight
+   and that a private-network install can't reach). @fontsource
+   ships the woff2 locally → same-origin, no preflight. Must lead
+   the file: CSS @import is only valid before other statements. */
+@import '@fontsource/geist-sans/400.css';
+@import '@fontsource/geist-sans/500.css';
+@import '@fontsource/geist-sans/600.css';
+@import '@fontsource/geist-sans/700.css';
+@import '@fontsource/geist-mono/400.css';
+@import '@fontsource/geist-mono/500.css';
+@import '@fontsource/geist-mono/600.css';
+@import '@fontsource/instrument-serif/400.css';
+@import '@fontsource/instrument-serif/400-italic.css';
+@import "tailwindcss";
+
+/* Design system + per-page modules go into the components layer
+   so Tailwind utilities (in the utilities layer) can override them.
+   Without this, tokens.css's universal `* { padding: 0 }` reset —
+   being unlayered — always beat Tailwind classes like `.p-8`. */
+@import "./styles/tokens.css"       layer(components);
+@import "./styles/model.css"        layer(components);
+@import "./styles/layout.css"       layer(components);
+@import "./styles/login.css"        layer(components);
+@import "./styles/activity.css"     layer(components);
+@import "./styles/users.css"        layer(components);
+@import "./styles/teams.css"        layer(components);
+@import "./styles/cost-reports.css" layer(components);
+@import "./styles/jobs.css"         layer(components);
+@import "./styles/settings.css"     layer(components);
+@import "./styles/velocity-cost.css" layer(components);
+
+/* Tailwind theme bindings — radius + font tokens only. The
+   old `--color-*` legacy aliases were retired in #209;
+   components reference the system tokens (--accent, --ink,
+   --bg, --surface, etc) directly from tokens.css. */
+@theme {
+  --radius-sm: var(--r-sm);
+  --radius:    var(--r-md);
+  --radius-lg: var(--r-lg);
+  --radius-xl: var(--r-xl);
+
+  --font-display: var(--display);
+  --font-body:    var(--sans);
+  --font-numeric: var(--mono);
+  --font-sans:    var(--sans);
+}
+
+/* tokens.css already sets html/body resets. */
+
+#root {
+  width: 100%;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.font-display { font-family: var(--display); font-weight: 400; font-style: italic; letter-spacing: -0.01em; }
+.font-numeric { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.tabular { font-variant-numeric: tabular-nums; }

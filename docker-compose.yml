@@ -1,0 +1,175 @@
+# Project name (and host port allocation) can be overridden
+# by sourcing scripts/tg-env.sh — that lets dev + stage run
+# in parallel on the same host. Defaults below preserve the
+# legacy public-INSTALL.md behavior (project=tokengov,
+# host ports :8000/:5432). See issue #145.
+name: ${COMPOSE_PROJECT_NAME:-tokengov}
+
+# #583: local-surface log retention analogue. ECS ships stdout to
+# CloudWatch (retention = LogRetentionDays, default 7d); locally
+# the json-file driver caps each container's logs by size×count
+# so they can't grow unbounded on a dev box. Tunable via
+# TG_LOG_MAX_SIZE / TG_LOG_MAX_FILE.
+x-app-logging: &app-logging
+  driver: json-file
+  options:
+    max-size: ${TG_LOG_MAX_SIZE:-10m}
+    max-file: "${TG_LOG_MAX_FILE:-5}"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: tg
+      POSTGRES_USER: tg
+      POSTGRES_PASSWORD: tg
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${TG_PG_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tg"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: container/Dockerfile
+      args:
+        # #538: real product version into /api/version (UI footer).
+        # tg-local-install.sh exports TG_VERSION=$(git describe ...);
+        # defaults to 'dev' for a bare `docker compose build`.
+        TG_VERSION: ${TG_VERSION:-dev}
+        # Cache-bust the SPA build stage on any admin-ui/web change
+        # (a stale ui-stage layer has served an old bundle). The
+        # installer/reviewer exports UI_SRC_HASH=$(git tree hash);
+        # 'none' for a bare build keeps today's caching.
+        UI_SRC_HASH: ${UI_SRC_HASH:-none}
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      DATABASE_URL: postgresql://tg:tg@postgres:5432/tg
+      AWS_REGION: us-east-1
+      ALLOWED_DOMAINS: ""
+      # boto3 native credential-chain pattern (#116):
+      # mount ~/.aws/ ro and set AWS_PROFILE so boto3
+      # walks the host's profile chain inside the
+      # container. The install profile uses
+      # credential_source=Ec2InstanceMetadata, so boto3
+      # calls AssumeRole itself, caches the result, and
+      # silently re-issues as expiry approaches. No
+      # AWS_ACCESS_KEY_ID/SECRET/SESSION_TOKEN env vars
+      # — those would freeze creds at container start
+      # and force the timer-based recreate hack we used
+      # to need.
+      # In ECS/EKS the workload spec must NOT set
+      # AWS_PROFILE; the container-native provider
+      # (task role / IRSA) wins by default.
+      AWS_PROFILE: ${AWS_PROFILE:-tg-install-${AWS_ACCOUNT_ID}}
+      AWS_ACCOUNT_ID: ${AWS_ACCOUNT_ID:-}
+      TG_AUTH_TEST_TRUST: ${TG_AUTH_TEST_TRUST:-}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      ATHENA_RESULTS_BUCKET: ${ATHENA_RESULTS_BUCKET:-}
+      ATHENA_DATABASE: ${ATHENA_DATABASE:-}
+      ATHENA_WORKGROUP: ${ATHENA_WORKGROUP:-}
+      CUR_TABLE_NAME: ${CUR_TABLE_NAME:-data}
+      # #358: ARN the api container assumes for every CUR
+      # / Athena call. Empty → analytics returns a clean
+      # 503 instead of silently using the host's profile.
+      TG_API_RUNNER_ROLE_ARN: ${TG_API_RUNNER_ROLE_ARN:-}
+      # OIDC login wall — empty defaults keep local dev open
+      # (no login required); set TG_AUTH_REQUIRE_LOGIN=1 +
+      # the four TG_OIDC_* vars to gate the SPA/docs.
+      TG_AUTH_REQUIRE_LOGIN: ${TG_AUTH_REQUIRE_LOGIN:-}
+      TG_OIDC_ISSUER: ${TG_OIDC_ISSUER:-}
+      TG_OIDC_CLIENT_ID: ${TG_OIDC_CLIENT_ID:-}
+      TG_OIDC_CLIENT_SECRET: ${TG_OIDC_CLIENT_SECRET:-}
+      TG_OIDC_REDIRECT_URI: ${TG_OIDC_REDIRECT_URI:-}
+      # #357: Cognito admin provisioning. tg-local-install
+      # writes these into .env.tg, but compose only injects
+      # vars it explicitly names (--env-file does ${VAR}
+      # interpolation, not auto-passthrough) — so the api
+      # container needs them listed here or
+      # cognito_provisioning is always false on the local
+      # surface. ECS wires the same two on ApiTaskDefinition.
+      TG_AUTH_PROVIDER: ${TG_AUTH_PROVIDER:-}
+      TG_COGNITO_USER_POOL_ID: ${TG_COGNITO_USER_POOL_ID:-}
+      # Cookies use Secure by default; flip off for plain
+      # http://localhost dev.
+      TG_COOKIE_INSECURE: ${TG_COOKIE_INSECURE:-}
+      # #583: structured logging. Default JSON; set
+      # TG_LOG_FORMAT=plain for human tailing in local dev.
+      TG_LOG_FORMAT: ${TG_LOG_FORMAT:-json}
+      TG_LOG_LEVEL: ${TG_LOG_LEVEL:-INFO}
+    volumes:
+      - ./container:/app
+      - ${HOME}/.aws:/home/app/.aws:ro
+    ports:
+      - "${TG_API_PORT:-8000}:8000"
+    logging: *app-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: container/Dockerfile
+      args:
+        TG_VERSION: ${TG_VERSION:-dev}   # #538 — see api above
+    command: python -m worker.main
+    environment:
+      DATABASE_URL: postgresql://tg:tg@postgres:5432/tg
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      LOG_GROUP: ${LOG_GROUP:-/aws/bedrock/invocations}
+      ROLE_NAME_FILTER: ${ROLE_NAME_FILTER:-tg-consumer}
+      DENY_POLICY_NAME: ${DENY_POLICY_NAME:-tg-BedrockQuotaDeny}
+      TG_TOKEN_CONSUMER_ROLE_NAME: ${TG_TOKEN_CONSUMER_ROLE_NAME:-tg-consumer}
+      # #762: SMTP_*/ALERT_EMAIL_TO removed with the quota_monitor
+      # email path — the in-app quota display is the alert surface.
+      # See `api` service comment — same pattern (#116).
+      AWS_PROFILE: ${AWS_PROFILE:-tg-install-${AWS_ACCOUNT_ID}}
+      AWS_ACCOUNT_ID: ${AWS_ACCOUNT_ID:-}
+      TG_AUTH_TEST_TRUST: ${TG_AUTH_TEST_TRUST:-}
+      # #583: structured logging (see api service).
+      TG_LOG_FORMAT: ${TG_LOG_FORMAT:-json}
+      TG_LOG_LEVEL: ${TG_LOG_LEVEL:-INFO}
+    volumes:
+      - ./container:/app
+      - ${HOME}/.aws:/home/app/.aws:ro
+    logging: *app-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── Optional: TLS terminator (#128) ─────────────────────
+  # Caddy reverse-proxies https://<hostname>/ → api:8000 and
+  # auto-issues a Let's Encrypt cert. Opt-in via the `tls`
+  # profile so a hostname-less local dev stack stays simple:
+  #
+  #   cp caddy/Caddyfile.example caddy/Caddyfile
+  #   # edit HOSTNAME and EMAIL placeholders
+  #   docker compose --profile tls up -d caddy
+  #
+  # See docs/admin-tls.md for the DNS/SG/A-record prereqs.
+  caddy:
+    image: caddy:2
+    profiles: ["tls"]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_logs:/var/log/caddy
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
+  caddy_logs:

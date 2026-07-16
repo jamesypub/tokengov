@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# tg — one-click install CLI entrypoint (#487).
+#
+# Thin launcher for the Python tg_cli package under
+# scripts/python/. Keeps `tg install` / `tg status` /
+# `tg destroy` runnable without installing a wheel:
+#   scripts/tg install
+#   scripts/tg install --dry-run
+#   scripts/tg destroy --full
+#
+# The CLI wraps the proven bash installers (tg-ecs-install.sh,
+# tg-ecs-destroy.sh) + the cert helper — it owns no deploy logic.
+#
+# Optional, for the nicer guided prompts:
+#   pip install -r scripts/python/requirements.txt   (questionary)
+# Without it the wizard falls back to plain input() — still works.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+export PYTHONPATH="$HERE/python${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m tg_cli "$@"

@@ -1,0 +1,47 @@
+{
+  "_comment": "Public, synthetic e2e seed — teams + users + roles + a little spend + pricing. All emails are @example.com and ids are scrub-safe (no real account ids). Loaded into a clean DB by e2e/seed.py so the e2e suite runs on a fresh stack with no dependency on the private populator.",
+  "teams": [
+    { "team_id": "team-1", "name": "Engineering", "parent_team_id": null },
+    { "team_id": "team-1.1", "name": "Platform", "parent_team_id": "team-1" }
+  ],
+  "users": [
+    {
+      "email": "org-admin@example.com",
+      "status": "active",
+      "cap_usd": null,
+      "team_id": null,
+      "principal_arn": "arn:aws:iam::123456789012:role/tg-consumer",
+      "principal_type": "assumed_role"
+    },
+    {
+      "email": "member-1@example.com",
+      "status": "active",
+      "cap_usd": 100.0,
+      "team_id": "team-1.1",
+      "principal_arn": "arn:aws:iam::123456789012:role/tg-consumer",
+      "principal_type": "assumed_role"
+    }
+  ],
+  "admin_roles": [
+    { "email": "org-admin@example.com", "role": "org_admin", "team_id": null },
+    { "email": "member-1@example.com", "role": "member", "team_id": "team-1.1" }
+  ],
+  "model_pricing": [
+    {
+      "model_id": "us.anthropic.claude-opus-4-8",
+      "input_per_1m": 15.0,
+      "output_per_1m": 75.0,
+      "cache_write_per_1m": 18.75,
+      "cache_read_per_1m": 1.5
+    }
+  ],
+  "cur_user_spend": [
+    {
+      "email": "member-1@example.com",
+      "model_id": "us.anthropic.claude-opus-4-8",
+      "input_tokens": 100000,
+      "output_tokens": 20000,
+      "spend_usd": 3.0
+    }
+  ]
+}

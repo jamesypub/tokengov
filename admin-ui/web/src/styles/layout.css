@@ -1,0 +1,333 @@
+/* layout.css — app shell (sidebar + main area) in design tokens.
+
+   Replaces the dark-blue AWS chrome (#232F3E + AWS-orange active)
+   with a light editorial surface: white sidebar on off-white page,
+   indigo-soft active state, mono section labels, Instrument Serif
+   brand mark.
+
+   The component classes here are scoped under .tg-shell so they
+   don't accidentally style the desktop binary's pre-SSO screen. */
+
+.tg-shell {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+.tg-shell__aside {
+  position: fixed;
+  top: 0;
+  left: 0;
+  height: 100vh;
+  width: 240px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  z-index: 10;
+}
+
+.tg-shell__main {
+  grid-column-start: 2;
+  grid-column-end: 3;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.tg-shell__spacer {
+  width: 240px;
+}
+
+/* ── brand ── */
+.tg-brand {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 22px 22px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.tg-brand__name {
+  font-family: var(--display);
+  font-style: italic;
+  font-weight: 400;
+  font-size: 22px;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+.tg-brand__tagline {
+  font-family: var(--display);
+  font-style: italic;
+  font-weight: 400;
+  font-size: 12.5px;
+  letter-spacing: 0.02em;
+  color: var(--ink-3);
+  padding-left: 10px;
+}
+.tg-brand__name .dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-right: 4px;
+  vertical-align: middle;
+}
+.tg-brand__ver {
+  font-family: var(--mono);
+  font-style: normal;
+  font-size: 10.5px;
+  color: var(--ink-4);
+  background: var(--surface-2);
+  padding: 2px 6px;
+  border-radius: 4px;
+  letter-spacing: 0.04em;
+}
+
+/* ── nav ── */
+.tg-nav {
+  flex: 1;
+  padding: 14px 12px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.tg-nav__section-label {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: var(--ink-5);
+  text-transform: uppercase;
+  padding: 14px 10px 6px;
+}
+.tg-nav__item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 7px 10px;
+  margin-bottom: 1px;
+  border-radius: var(--r-sm);
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--ink-3);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+  text-decoration: none;
+}
+.tg-nav__item:hover {
+  background: var(--surface-2);
+  color: var(--ink);
+}
+.tg-nav__item.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 500;
+}
+.tg-nav__item.is-active svg {
+  color: var(--accent);
+}
+.tg-nav__item svg {
+  flex-shrink: 0;
+  color: var(--ink-4);
+}
+.tg-nav__item > span:first-of-type { flex: 1; }
+
+/* #624: discovered-models-need-pricing count badge */
+.tg-nav__badge {
+  flex-shrink: 0;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* ── footer (team selector + user row + sign out) ── */
+.tg-foot {
+  border-top: 1px solid var(--border);
+  padding: 14px 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.tg-foot__label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: var(--ink-5);
+  text-transform: uppercase;
+}
+.tg-foot__select,
+.tg-foot__select-dev {
+  width: 100%;
+  padding: 6px 8px;
+  font-family: var(--sans);
+  font-size: 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border-2);
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+}
+.tg-foot__select:focus,
+.tg-foot__select-dev:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.tg-foot__select-dev {
+  background: var(--amber-soft);
+  border-color: var(--amber-edge);
+  color: var(--amber);
+}
+.tg-foot__select-dev-label {
+  color: var(--amber);
+}
+
+.tg-foot__user {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.tg-foot__avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 12px;
+  flex-shrink: 0;
+  text-decoration: none;
+}
+.tg-foot__user-info {
+  flex: 1;
+  min-width: 0;
+}
+.tg-foot__email {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tg-foot__role {
+  font-size: 10.5px;
+  color: var(--ink-4);
+  text-transform: capitalize;
+  font-family: var(--mono);
+  letter-spacing: 0.02em;
+}
+.tg-foot__signout {
+  background: transparent;
+  border: none;
+  color: var(--ink-4);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: var(--r-sm);
+  display: flex;
+  align-items: center;
+}
+.tg-foot__signout:hover {
+  color: var(--ink);
+  background: var(--surface-2);
+}
+.tg-foot__version {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-5);
+  letter-spacing: 0.04em;
+}
+
+/* ── mobile top bar ── */
+.tg-shell--mobile {
+  background: var(--bg);
+  min-height: 100vh;
+}
+.tg-mobile-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 50;
+  height: 50px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.tg-mobile-bar button {
+  background: transparent;
+  border: none;
+  color: var(--ink-3);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+}
+.tg-mobile-bar__brand {
+  font-family: var(--display);
+  font-style: italic;
+  font-size: 16px;
+  color: var(--ink);
+}
+.tg-drawer-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+}
+.tg-drawer {
+  width: 280px;
+  height: 100%;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+.tg-drawer__close {
+  display: flex;
+  justify-content: flex-end;
+  padding: 14px 16px 4px;
+}
+.tg-drawer__close button {
+  background: transparent;
+  border: none;
+  color: var(--ink-4);
+  cursor: pointer;
+}
+.tg-drawer__scrim {
+  flex: 1;
+  background: rgba(10, 10, 10, 0.4);
+}
+.tg-shell--mobile main {
+  padding-top: 50px;
+}
+
+/* Skeleton loading rows for nav. */
+.tg-nav__skeleton {
+  height: 30px;
+  background: var(--surface-2);
+  border-radius: var(--r-sm);
+  margin-bottom: 4px;
+  animation: tg-pulse 1.4s ease-in-out infinite;
+}
+@keyframes tg-pulse {
+  0%, 100% { opacity: 0.5; }
+  50%      { opacity: 1; }
+}

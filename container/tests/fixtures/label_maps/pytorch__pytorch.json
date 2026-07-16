@@ -1,0 +1,5 @@
+{
+  "story": ["enhancement", "feature", "module: distributed"],
+  "bug":   ["bug", "module: crashes", "high priority"],
+  "task":  ["topic: docs", "ci", "release notes: docs"]
+}

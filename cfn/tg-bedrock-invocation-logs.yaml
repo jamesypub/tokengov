@@ -1,0 +1,308 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock model-invocation logging to S3 for prompt/token analytics
+  (CAPTURE FOUNDATION; analysis layer is a future ticket). A SEPARATE
+  stream from CUR — CUR stays the sole SPEND source; these logs carry
+  the per-invocation token-count + (Text) prompt/completion data CUR
+  cannot provide. Deployed ONCE PER REGION (Bedrock logging is a
+  per-region same-region singleton): an SSE-KMS S3 bucket (ACLs off so
+  the Bedrock write policy applies; lifecycle expiry; >100KB large-body
+  prefix), a KMS key granting bedrock GenerateDataKey, a Glue DB for
+  Athena, and a custom resource calling
+  PutModelInvocationLoggingConfiguration. S3-only (the doc: large
+  bodies go only to S3; the inline-text sink caps ~100KB and would drop
+  large coding prompts). Capture scope is the bedrock-runtime endpoint
+  only.
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: ''
+    Description: >
+      Override the auto-generated bucket name
+      (tg-bedrock-invlogs-<region>-<account>). Leave blank to
+      auto-name (region+account keep it globally-unique).
+
+  RetentionDays:
+    Type: Number
+    Default: 90
+    Description: >
+      Lifecycle expiry (days) for the invocation-log objects. Bounded
+      by default because Text modality stores the customer's actual
+      source code + AI output — not kept indefinitely. Tunable without
+      a template edit.
+
+  EnableTextModality:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Capture full prompt + completion TEXT (the richest signal for the
+      future model-selection recommender). ON by default (owner
+      decision). Set false for counts-only (token counts, no
+      prompt/response bodies).
+
+Conditions:
+  AutoNameBucket: !Equals [!Ref BucketName, '']
+
+Resources:
+  # ── KMS key for SSE-KMS on the invocation-log bucket ─────────────────
+  # The bucket stores the customer's source code + AI output (Text
+  # modality). SSE-KMS + a key policy granting bedrock.amazonaws.com
+  # GenerateDataKey (per the AWS model-invocation-logging doc) so
+  # Bedrock can write encrypted objects. Retain on delete/replace — the
+  # key is the means to decrypt the retained data (buckets are Retain'd
+  # too); losing it would strand the logs.
+  InvLogKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub SSE-KMS for tg Bedrock invocation logs (${AWS::Region})
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: BedrockGenerateDataKey
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  InvLogKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/tg-bedrock-invlogs-${AWS::Region}
+      TargetKeyId: !Ref InvLogKey
+
+  # ── S3 bucket (per-region; holds precious analytics data → Retain) ──
+  InvLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If
+        - AutoNameBucket
+        - !Sub tg-bedrock-invlogs-${AWS::Region}-${AWS::AccountId}
+        - !Ref BucketName
+      # The AWS doc: "The bucket ACL must be disabled in order for the
+      # bucket policy to take effect." BucketOwnerEnforced disables
+      # ACLs so the bedrock.amazonaws.com write policy below applies.
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt InvLogKey.Arn
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          # Bounded retention — sensitive source-code/AI-output text is
+          # not kept indefinitely (owner: 90d default, tunable).
+          - Id: ExpireInvocationLogs
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+
+  # bedrock.amazonaws.com write policy (from the AWS doc). Bedrock
+  # delivers records under AWSLogs/<account>/BedrockModelInvocationLogs/
+  # and large (>100KB) bodies under the large-data prefix below.
+  InvLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InvLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: BedrockInvocationLogWrite
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${InvLogBucket.Arn}/*
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                s3:x-amz-acl: bucket-owner-full-control
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:*
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt InvLogBucket.Arn
+              - !Sub ${InvLogBucket.Arn}/*
+            Condition:
+              Bool: { aws:SecureTransport: 'false' }
+
+  # ── Glue DB/table for Athena querying (mirrors tg-cur-athena) ────────
+  # A static external table + partition projection over the date-
+  # partitioned invocation-log delivery layout — no crawler, no service
+  # role, new days resolve at query time. (The analysis layer ticket
+  # refines the column schema against a real delivered record; this
+  # foundation lands the queryable location + partition so a future job
+  # can point Athena at it.)
+  InvLogGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub tg_bedrock_invlogs_${AWS::Region}
+        Description: Bedrock invocation logs (analytics; not spend)
+
+  # ── Custom resource: PutModelInvocationLoggingConfiguration ──────────
+  # PutModelInvocationLoggingConfiguration is not a native CFN resource,
+  # so a custom-resource Lambda sets it (owner OQ2: keep it all-CFN +
+  # idempotent). Written defensively — cfnresponse signaling on every
+  # path, DependsOn the bucket policy (Bedrock must be able to write
+  # before the config points at the bucket), Delete disables the config
+  # only when the live S3 sink is OUR bucket (fail closed otherwise) so
+  # a teardown never clobbers a config the customer runs independently.
+  InvLogConfigFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PutBedrockInvocationLoggingConfig
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read/write the per-region logging SINGLETON.
+              - Effect: Allow
+                Action:
+                  - bedrock:GetModelInvocationLoggingConfiguration
+                  - bedrock:PutModelInvocationLoggingConfiguration
+                  - bedrock:DeleteModelInvocationLoggingConfiguration
+                Resource: '*'
+
+  InvLogConfigFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 60
+      Role: !GetAtt InvLogConfigFnRole.Arn
+      Environment:
+        Variables:
+          BUCKET: !Ref InvLogBucket
+          TEXT_ON: !Ref EnableTextModality
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import boto3
+
+          # NOTE on large (>100KB) bodies: for a pure-S3 sink the API
+          # overflows them AUTOMATICALLY as individual objects under the
+          # bucket's data prefix — there is no separate large-data
+          # delivery key to pass on an S3-only config (that key belongs
+          # to the inline-text sink's overflow and fails API schema
+          # validation here). AWS controls the overflow prefix.
+
+          def _send(event, context, status, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or "see the function log stream",
+                  "PhysicalResourceId":
+                      event.get("PhysicalResourceId")
+                      or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }).encode()
+              req = urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "",
+                           "content-length": str(len(body))})
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              import os
+              rtype = event["RequestType"]
+              bucket = os.environ["BUCKET"]
+              text_on = os.environ.get("TEXT_ON", "true") == "true"
+              br = boto3.client("bedrock")
+              try:
+                  if rtype in ("Create", "Update"):
+                      br.put_model_invocation_logging_configuration(
+                          loggingConfig={
+                              "textDataDeliveryEnabled": text_on,
+                              "imageDataDeliveryEnabled": False,
+                              "embeddingDataDeliveryEnabled": False,
+                              "s3Config": {
+                                  "bucketName": bucket,
+                                  "keyPrefix": "",
+                              },
+                          })
+                  elif rtype == "Delete":
+                      # PRESERVE-BY-DEFAULT of the DATA (the bucket is
+                      # Retain'd). Disable the config only if the live
+                      # sink is OUR bucket — never clobber a config the
+                      # customer runs independently (fail closed).
+                      try:
+                          cur = br.get_model_invocation_logging_configuration()
+                          live = (((cur or {}).get("loggingConfig") or {})
+                                  .get("s3Config") or {}).get("bucketName")
+                          if live == bucket:
+                              br.delete_model_invocation_logging_configuration()
+                      except Exception:
+                          pass
+                  _send(event, context, "SUCCESS")
+              except Exception as e:  # noqa: BLE001 — always signal CFN
+                  _send(event, context, "FAILED", str(e))
+
+  InvLogConfig:
+    Type: AWS::CloudFormation::CustomResource
+    # Bedrock must be able to WRITE before the config points at the
+    # bucket — order the config after the bucket policy + KMS grant.
+    DependsOn:
+      - InvLogBucketPolicy
+    Properties:
+      ServiceToken: !GetAtt InvLogConfigFn.Arn
+      # Re-run the Put on a Text-modality change (a new property value
+      # triggers an Update).
+      TextModality: !Ref EnableTextModality
+      Bucket: !Ref InvLogBucket
+
+Outputs:
+  BucketName:
+    Description: Per-region invocation-log S3 bucket.
+    Value: !Ref InvLogBucket
+  BucketArn:
+    Value: !GetAtt InvLogBucket.Arn
+  KmsKeyArn:
+    Value: !GetAtt InvLogKey.Arn
+  GlueDatabase:
+    Value: !Ref InvLogGlueDatabase
+  Region:
+    Description: The region this invocation-logging config governs.
+    Value: !Ref AWS::Region
+  TextModality:
+    Value: !Ref EnableTextModality

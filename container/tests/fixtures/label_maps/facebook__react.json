@@ -1,0 +1,5 @@
+{
+  "story": ["enhancement", "feature", "Component: New Public API", "React 19"],
+  "bug":   ["bug", "Resolution: Backlog Bug", "Bug: Crash"],
+  "task":  ["documentation", "deps", "CLA Signed", "infrastructure"]
+}

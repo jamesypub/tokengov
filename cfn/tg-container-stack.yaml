@@ -1,0 +1,2091 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  tg-container-stack: VPC + ALB + ECS Fargate cluster running the
+  Token Governance api + APScheduler worker against an RDS Postgres 16
+  backing store. Secrets Manager generates the DB password; ECS injects
+  it via the task definition Secrets attribute. Bedrock-layer roles
+  (tg-consumer, tg-BedrockQuotaDeny) are assumed to already
+  exist (deployed by tg-bedrock-role.yaml).
+
+Parameters:
+  EcsImageUri:
+    Type: String
+    Default: ''
+    Description: >
+      Full ECR image URI (with tag) to run for both api + worker.
+      Leave blank to default to the in-stack ECR repo at :latest.
+
+  # CUR reuse path: when the installer reuses an existing CUR 2.0
+  # export instead of creating tg's own, the export's data lives in a
+  # customer-owned, account-local S3 bucket. Set this to that bucket's
+  # ARN so the app task role can read it; the S3ReadForCurAndAthena
+  # grant adds the bucket + its objects only when this is non-empty.
+  # Leave blank (default) on the normal create path.
+  ReusedCurBucketArn:
+    Type: String
+    Default: ''
+    Description: >
+      REUSE path only. ARN of the existing CUR export's S3 bucket
+      (e.g. arn:aws:s3:::acme-billing) to grant the app task role
+      read access to. Leave blank on the create path.
+
+  # #774: bring-your-own VPC. Default empty → tg creates a fresh
+  # 2-AZ VPC + IGW + subnets + routing (greenfield, unchanged). Set
+  # ExistingVpcId + ExistingSubnetIds (≥2 subnets across ≥2 AZs, with
+  # an internet egress route) to deploy into an existing VPC instead
+  # — required on accounts at the VPC/IGW service limit (#772). When
+  # BYO, tg owns NO networking (the VPC/IGW/subnets/routes are NOT
+  # stack resources), so a stack delete leaves them intact.
+  ExistingVpcId:
+    Type: String
+    Default: ''
+    Description: >
+      Existing VPC ID to deploy into (e.g. vpc-0abc123). Leave blank
+      to create a new VPC. When set, ExistingSubnetIds is required.
+  ExistingSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >
+      Comma-separated subnet IDs in ExistingVpcId — ≥2 across ≥2 AZs
+      (the RDS + ALB 2-AZ floor, #480), each with a route to an
+      IGW/NAT. Ignored when ExistingVpcId is blank.
+  # #779: the ECS task's AssignPublicIp for the BYO path. On
+  # create-new, tasks run in tg's private subnets behind a NAT so it
+  # is always DISABLED (hardcoded on those services). On BYO the
+  # installer's egress pre-flight sets this: ENABLED for public
+  # (IGW-routed) subnets so the task can reach Secrets Manager / ECR
+  # / Logs to start; DISABLED for NAT-routed or endpoint-served
+  # private subnets. Only consumed by the *Byo services.
+  AssignTaskPublicIp:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >
+      ECS task AssignPublicIp on the existing-VPC (BYO) path. Set by
+      the installer from the chosen subnets' egress (#779). Ignored
+      on the create-new path.
+
+  BootstrapAdminEmail:
+    Type: String
+    Default: admin@example.com
+    Description: Seeded admin user email (used by api bootstrap)
+
+  InvocationLogRegions:
+    Type: String
+    Default: ''
+    Description: >
+      Comma-separated regions where Bedrock invocation-logging capture
+      (analytics) is enabled. The api seeds the admin_config catalog
+      from this on startup (like the bootstrap admin). Blank = none.
+
+  AllowedDomains:
+    Type: String
+    Default: ''
+    Description: Comma-separated email domains allowed to sign in
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, stage, prod]
+    Default: prod
+    Description: >
+      Deployment environment. Gates the test-auth bypass (#570):
+      dev/stage may enable it (zero-config seeding + persona
+      walk-throughs); prod NEVER can — TG_AUTH_TEST_TRUST is
+      forced to 0 regardless of EnableTestAuthTrust. Default is
+      prod (fail-safe: an un-parameterized deploy gets the locked
+      behavior).
+
+  EnableTestAuthTrust:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: >
+      When 'true' sets TG_AUTH_TEST_TRUST=1 in the api task env —
+      but ONLY when Environment != prod (#570). In prod the env
+      var is forced to 0 even if this is 'true'. Disable in any
+      non-dev/stage environment.
+
+  DesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 4
+    Description: >
+      ECS service desired count for both api and worker. Use 0
+      on first deploy (so stack create completes before the
+      image is pushed to ECR), then set to 1 on a follow-up
+      deploy or via aws ecs update-service.
+
+  RoleNameFilter:
+    Type: String
+    Default: tg-consumer
+  DenyPolicyName:
+    Type: String
+    Default: tg-BedrockQuotaDeny
+  TokenConsumerRoleName:
+    Type: String
+    Default: tg-consumer
+
+  SonnetProfileId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+  HaikuProfileId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+  OpusProfileId:
+    Type: String
+    Default: us.anthropic.claude-opus-4-7
+
+  # #497 (#474 dec 6): the EnableAlb=false / api-on-public-task-IP
+  # path is retired. The ALB is the only endpoint — internet-
+  # facing-SG-locked by default. (AlbScheme controls internal vs
+  # internet-facing; see #495.)
+
+  AlbScheme:
+    Type: String
+    Default: internet-facing
+    AllowedValues: ['internet-facing', 'internal']
+    Description: >
+      #474 dec 6/6a: ALB scheme. DEFAULT 'internet-facing' —
+      reachable without a corp↔VPC bridge, locked down at the
+      SG layer to the AllowedIngressCidr* corp egress CIDRs (the
+      login wall is the second control). 'internal' is the
+      opt-in for customers who already have a bridge
+      (VPN/DX/TGW) and want zero public surface — it removes the
+      public IP but then the endpoint is unreachable without
+      that bridge. The SG allowlist (#183) applies either way;
+      neither scheme opens 0.0.0.0/0 except the explicit
+      login-gated opt-in already gated by the installer.
+
+  DataProtection:
+    Type: String
+    Default: 'disposable'
+    AllowedValues: ['protected', 'disposable']
+    Description: >
+      #406 dual-resource RDS data-loss protection. #481 (epic
+      #474 dec 3): DEFAULT is now 'disposable' so the one-click
+      install → tg destroy flow leaves a TRUE clean slate.
+      'disposable' → DeletionPolicy/UpdateReplacePolicy Delete,
+      no DeletionProtection, 1-day backups: tg-ecs-destroy is
+      frictionless (no orphaned paid snapshots, no re-create
+      blocks). 'protected' (opt in for stage/prod with data to
+      keep) → DeletionPolicy/UpdateReplacePolicy Snapshot,
+      DeletionProtection true, BackupRetentionPeriod 7: an
+      accidental stack delete keeps a final snapshot and the
+      live DB can't be dropped without first disabling
+      protection. NOTE: the secure-default flip here is
+      deliberate for the guided clean-teardown product — set
+      DataProtection=protected on any deployment whose data
+      must survive a stack delete.
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Description: >
+      #595: app log level for api + worker (TG_LOG_LEVEL). Default
+      INFO; set DEBUG to troubleshoot. JSON output (TG_LOG_FORMAT=
+      json) is already set on the task defs (#583).
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+    Description: >
+      #583: how long the app's structured JSON logs are kept in
+      the /ecs/tg-container CloudWatch group before CloudWatch
+      truncates them. Default 7 days (the user's chosen default);
+      configurable. The installer derives this from
+      TG_LOG_RETENTION_DAYS. Values are the CloudWatch-allowed
+      retention set.
+
+  TgVersion:
+    Type: String
+    Default: dev
+    Description: >
+      #791: the product version /api/version reports (UI footer +
+      the version-keyed UAT dedup/trigger). Passed as the TG_VERSION
+      task-def env so it is stamped at DEPLOY time. TG_VERSION is
+      also baked into the image (Dockerfile build-arg, #538), but
+      the #553 image-skip path reuses a prior image — so a build
+      that once stamped 'dev' (tagless/dirty context) would keep
+      serving 'dev' on every later deploy. The task-def env OVERRIDES
+      the baked value at runtime, so the deploy-time
+      `git describe`-derived version always wins. The installer sets
+      this from TG_VERSION.
+
+  AllowedIngressCidr1:
+    Type: String
+    Default: ''
+    Description: >
+      Primary CIDR allowed to reach the ALB (:80, and :443 when
+      a cert is configured). MUST be a real CIDR — empty means
+      no rule is created (fail-closed: no internet ingress
+      at all). Set to your office / VPN egress CIDR (e.g.
+      "203.0.113.0/24"); that is the default and the
+      recommendation for customers/prod. 0.0.0.0/0 is
+      permitted ONLY as an explicit opt-in when the app
+      login gate is enabled (RequireLogin=true) — the
+      verified login wall is the compensating control
+      (AppSec V2226500622 / GH #183, risk-accepted #416).
+      With the login gate off, world-open ingress is
+      rejected by the installer. Use slots 2-4 below if you
+      need more.
+  AllowedIngressCidr2:
+    Type: String
+    Default: ''
+    Description: Optional 2nd CIDR slot. Empty = slot disabled.
+  AllowedIngressCidr3:
+    Type: String
+    Default: ''
+    Description: Optional 3rd CIDR slot. Empty = slot disabled.
+  AllowedIngressCidr4:
+    Type: String
+    Default: ''
+    Description: Optional 4th CIDR slot. Empty = slot disabled.
+
+  RequireLogin:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      When 'true' (default), the api gates anonymous SPA /
+      docs / openapi requests behind the OIDC login flow
+      (302 to /auth/login). Anonymous /api/version,
+      /api/csrf, /auth/* and SigV4-presigned /api/* still
+      pass through. When 'false', SPA is served openly
+      (only safe for an internal CIDR).
+
+  OidcIssuer:
+    Type: String
+    Default: ''
+    Description: >
+      OIDC issuer URL (e.g. https://example.okta.com).
+      Required when RequireLogin=true.
+  OidcClientId:
+    Type: String
+    Default: ''
+    Description: OIDC client ID (Okta app).
+  # #432: OidcClientSecret is no longer a stack parameter. The
+  # secret lives in Secrets Manager (OidcClientSecretManaged
+  # below) and the api task def references it via `Secrets:`.
+  # Passing it as a NoEcho param + plain env Value was the
+  # mechanism that let the `UsePreviousValue=true` literal land
+  # in the task-def env on a secret-unset redeploy (#398/#403),
+  # taking stage login down (#431).
+  OidcRedirectUri:
+    Type: String
+    Default: ''
+    Description: >
+      Public callback URL — must match the Okta app's
+      registered redirect (e.g. http://<alb-dns>/auth/callback).
+
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: >
+      Optional ACM certificate ARN. When set, the ALB
+      gets an HTTPS listener on :443 + an HTTP→HTTPS
+      redirect on :80, and the SG opens :443 to the
+      AllowedIngressCidr* slots in addition to :80.
+      Empty (default): no TLS from this ARN — HTTPS then
+      needs IssueAcmCert=true, else the deploy requires the
+      explicit AllowPlaintextAlb=true HTTP opt-in. AWS won't
+      issue a public cert for *.elb.amazonaws.com — for
+      stage/dev run scripts/tg-make-selfsigned-cert.sh
+      (out-of-band; openssl + acm import) and pass the ARN it
+      prints. For prod, supply your own cert ARN. The stack /
+      installer never generate or import a cert themselves
+      (#474 dec 6: cert lifecycle is the operator's).
+
+  DomainName:
+    Type: String
+    Default: ''
+    Description: >
+      Optional custom DNS name (e.g. tg.example.com).
+      When DomainName + HostedZoneId are both set, an
+      A-alias record is created in the hosted zone
+      pointing at the ALB. Cognito callbacks should
+      then use https://<DomainName>/auth/callback.
+      Leave empty to use the raw ALB DNS.
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: >
+      Route53 hosted zone ID (e.g. Z1234ABCD) that
+      owns DomainName. Required if DomainName is set.
+
+  IssueAcmCert:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      When 'true' (and DomainName + HostedZoneId are
+      set, and CertificateArn is empty), the stack
+      issues a public ACM cert for DomainName via
+      Route53 DNS validation. The Route53Alias record
+      is also written, and HttpsListener uses the
+      issued cert. Stack creation blocks ~3-5 min
+      while the DNS challenge resolves. Use this for
+      automated dev/QA/prod when you have a hosted
+      zone; pass CertificateArn instead if you've
+      already issued / imported your own cert.
+
+  AllowPlaintextAlb:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      #474 dec 6 (D): explicit opt-in to serve the ALB over
+      plain HTTP :80 (no TLS). HTTPS is the default: pass a
+      CertificateArn (bring your own, or run
+      scripts/tg-make-selfsigned-cert.sh and pass the ARN it
+      prints), or set IssueAcmCert=true for an auto-issued
+      public cert. When NONE of those is set, the deploy is
+      REJECTED by the NoSilentPlaintextAlb Rule unless this is
+      'true' — HTTP is never silent. Only safe behind a tight
+      AllowedIngressCidr* allowlist; the login wall (#416)
+      remains the second control.
+
+  AthenaResultsBucket:
+    Type: String
+    Default: ''
+    Description: >
+      Athena query-results S3 location for the api's Cost
+      Reports page, e.g.
+      `s3://tg-cur-athena-results-<acct>-us-east-1/`.
+      Wired as ATHENA_RESULTS_BUCKET on the api task.
+      Empty (default) → Cost Reports returns 503 with the
+      "Cost Reports not configured. Run tg-cur-deploy.sh"
+      message; redeploy with this set after the CUR stack
+      is up. Source: `tg-cur-athena` stack export
+      `<stack>-AthenaResultsBucketName` (prefix with `s3://`
+      and trailing slash).
+
+  AthenaWorkgroup:
+    Type: String
+    Default: 'tg-cur-analytics'
+    Description: >
+      Athena workgroup that owns the saved CUR queries.
+      Wired as ATHENA_WORKGROUP. Default matches the
+      tg-cur-athena AthenaWorkgroupName default.
+
+  AthenaDatabase:
+    Type: String
+    Default: 'tg_cur'
+    Description: >
+      Glue database holding the CUR table. Wired as
+      ATHENA_DATABASE.
+
+  CurTableName:
+    Type: String
+    Default: 'data'
+    Description: >
+      Glue table name for the CUR 2.0 export. Wired as
+      CUR_TABLE_NAME. CUR 2.0 always lands the table as
+      'data'.
+
+  EnableServiceAccountBudgets:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      #346: per-role budget enforcement for service
+      principals. When 'true' the worker task role gains
+      tag-scoped iam:PutRolePolicy / iam:DeleteRolePolicy /
+      iam:ListRoleTags on roles tagged
+      `tg-budget-enforced=true`. Default 'false' so
+      customers must opt in to granting TG IAM-write
+      perms on tagged roles. The monitor job runs either
+      way; without this flag it can read spend and
+      enqueue alerts but cannot enforce.
+
+  EnableCognitoAdminProvisioning:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      #357: one-click "Send Cognito invite" admin
+      provisioning. When 'true' the task role gains
+      cognito-idp:AdminCreateUser / AdminGetUser /
+      AdminAddUserToGroup scoped to CognitoUserPoolArn,
+      and the API sets TG_AUTH_PROVIDER=cognito so the
+      UI shows the invite checkbox. Default 'false' so
+      Okta / desktop installs never carry the
+      Cognito-write perm in their blast radius.
+  CognitoUserPoolId:
+    Type: String
+    Default: ''
+    Description: >
+      #357: Cognito user pool id (a tg-cognito-pool stack
+      output). Passed to the container as
+      TG_COGNITO_USER_POOL_ID so AdminCreateUser targets
+      the right pool. Required when
+      EnableCognitoAdminProvisioning=true.
+  CognitoUserPoolArn:
+    Type: String
+    Default: ''
+    Description: >
+      #357: ARN of the same pool, used to scope the
+      cognito-idp:Admin* grant to this pool only (the
+      worker cannot create users in any other pool).
+      Required when EnableCognitoAdminProvisioning=true.
+
+Rules:
+  # #570 (supersedes #496's blanket reject): the test-trust auth
+  # bypass (X-Tg-Test-Email → org-admin, no SigV4) is gated by the
+  # named Environment param, not the ALB scheme. dev/stage may
+  # enable it (zero-config seeding + persona walk-throughs behind a
+  # tight CIDR allowlist); PROD never can. Reject a deploy that
+  # tries to enable the bypass in prod — structural enforcement so
+  # a direct `cloudformation deploy` can't re-open it (the original
+  # #443/#468 exposure). dev/stage with EnableTestAuthTrust=true is
+  # now permitted (the env-var condition below still belts-and-
+  # braces it, and #497's ALB is CIDR-locked).
+  TestTrustNeverInProd:
+    RuleCondition: !Equals [!Ref Environment, 'prod']
+    Assertions:
+      - Assert: !Equals [!Ref EnableTestAuthTrust, 'false']
+        AssertDescription: >
+          EnableTestAuthTrust=true is never allowed when
+          Environment=prod (#570): the test-trust header bypass
+          (X-Tg-Test-Email → org-admin, no SigV4) would let one
+          curl reach org-admin behind the ALB. Use dev/stage for
+          the bypass; prod auth is enforced (#443/#468/#496).
+
+  # #484 (#474 dec 6, Option D): HTTP is never silent. #497
+  # retired EnableAlb=false — the ALB is now always provisioned
+  # (the sole endpoint), so this Rule fires UNCONDITIONALLY (no
+  # RuleCondition): every deploy must configure TLS (no
+  # CertificateArn AND not auto-issuing via IssueAcmCert) or
+  # explicitly opt into plaintext with AllowPlaintextAlb=true.
+  # This forces a conscious choice instead of a stack silently
+  # coming up on :80. (The stack never generates a cert itself —
+  # self-signed is the operator-run
+  # scripts/tg-make-selfsigned-cert.sh, whose ARN is passed back
+  # as CertificateArn.)
+  NoSilentPlaintextAlb:
+    Assertions:
+      - Assert: !Or
+          - !Not [!Equals [!Ref CertificateArn, '']]
+          - !Equals [!Ref IssueAcmCert, 'true']
+          - !Equals [!Ref AllowPlaintextAlb, 'true']
+        AssertDescription: >
+          ALB requires TLS or an explicit plaintext opt-in:
+          set CertificateArn (bring your own, or run
+          scripts/tg-make-selfsigned-cert.sh and pass the ARN),
+          OR IssueAcmCert=true (auto-issue), OR
+          AllowPlaintextAlb=true to serve HTTP on purpose.
+          HTTP is never silent (#474 dec 6).
+
+Conditions:
+  ImageUriProvided: !Not [!Equals [!Ref EcsImageUri, '']]
+  # CUR reuse: extend the app task role's S3 read to the reused
+  # (customer-owned) CUR bucket only when its ARN is provided.
+  HasReusedCurBucket: !Not [!Equals [!Ref ReusedCurBucketArn, '']]
+  # #774: create a new VPC only when no existing one was supplied.
+  # When CreateVpc is false, the VPC/IGW/subnets/routing resources
+  # below are skipped and everything wires to the ExistingSubnetIds
+  # / ExistingVpcId params instead. UseExistingVpc is its inverse —
+  # gates the BYO variants of Alb/ApiService/WorkerService (which
+  # drop the create-new-only route/IGW DependsOn — tg owns no NAT/
+  # route to order-delete on BYO; the #532 HttpListener guard stays).
+  CreateVpc: !Equals [!Ref ExistingVpcId, '']
+  UseExistingVpc: !Not [!Equals [!Ref ExistingVpcId, '']]
+  # #406: data-loss protection. Default-safe — anything that
+  # isn't the explicit 'disposable' opt-in is treated as
+  # protected (so a forgotten/empty/typo'd value keeps data).
+  DbDisposable: !Equals [!Ref DataProtection, 'disposable']
+  DbProtected: !Not [!Equals [!Ref DataProtection, 'disposable']]
+  # #497: EnableAlb retired — the ALB is always created, so the
+  # former AlbEnabled/AlbDisabled + Cidr*AlbEnabled/AlbDisabled
+  # conditions are gone. ALB-only resources are now unconditional;
+  # per-CIDR ALB ingress keys directly off Cidr*Set.
+  # #570: test-trust (X-Tg-Test-Email → org-admin, no SigV4) is
+  # enabled in the task env ONLY when EnableTestAuthTrust=true AND
+  # Environment != prod. This is the belt-and-braces companion to
+  # the TestTrustNeverInProd Rule above: even if a deploy somehow
+  # reaches synthesis with EnableTestAuthTrust=true and
+  # Environment=prod (it can't — the Rule rejects it), the env var
+  # still lands 0. prod is structurally un-bypassable.
+  TestAuthTrustEnabled: !And
+    - !Equals [!Ref EnableTestAuthTrust, 'true']
+    - !Not [!Equals [!Ref Environment, 'prod']]
+  ServiceAccountBudgetsEnabled: !Equals
+    - !Ref EnableServiceAccountBudgets
+    - 'true'
+  CognitoAdminProvisioningEnabled: !Equals
+    - !Ref EnableCognitoAdminProvisioning
+    - 'true'
+  # Runtime SAML-IdP management (Settings → Authentication) needs the
+  # cognito-idp IdP/app-client grant whenever a pool ARN is wired —
+  # independent of the admin-provisioning (invite) toggle.
+  CognitoPoolArnProvided: !Not [!Equals [!Ref CognitoUserPoolArn, '']]
+  Cidr1Set: !Not [!Equals [!Ref AllowedIngressCidr1, '']]
+  Cidr2Set: !Not [!Equals [!Ref AllowedIngressCidr2, '']]
+  Cidr3Set: !Not [!Equals [!Ref AllowedIngressCidr3, '']]
+  Cidr4Set: !Not [!Equals [!Ref AllowedIngressCidr4, '']]
+  RequireLoginEnabled: !Equals [!Ref RequireLogin, 'true']
+  CertArnProvided: !Not [!Equals [!Ref CertificateArn, '']]
+  DomainProvided: !Not [!Equals [!Ref DomainName, '']]
+  HostedZoneProvided: !Not [!Equals [!Ref HostedZoneId, '']]
+  IssueAcmCertRequested: !Equals [!Ref IssueAcmCert, 'true']
+  # IssueCert: auto-issue when requested AND domain + hosted zone
+  # are set AND no CertificateArn was already supplied.
+  IssueCertEnabled: !And
+    - !Condition IssueAcmCertRequested
+    - !Condition DomainProvided
+    - !Condition HostedZoneProvided
+    - !Not [!Condition CertArnProvided]
+  # TlsEnabled is true if EITHER an ARN was supplied OR we're
+  # auto-issuing one. Listener / SG ingress / HTTP redirect
+  # all key off this single flag.
+  TlsEnabled: !Or
+    - !Condition CertArnProvided
+    - !Condition IssueCertEnabled
+  RouteAliasEnabled: !And
+    - !Condition DomainProvided
+    - !Condition HostedZoneProvided
+  Cidr1AlbTls: !And
+    - !Condition Cidr1Set
+    - !Condition TlsEnabled
+  Cidr2AlbTls: !And
+    - !Condition Cidr2Set
+    - !Condition TlsEnabled
+  Cidr3AlbTls: !And
+    - !Condition Cidr3Set
+    - !Condition TlsEnabled
+  Cidr4AlbTls: !And
+    - !Condition Cidr4Set
+    - !Condition TlsEnabled
+
+Resources:
+
+  # ─────────────────────────────────────────────────────────────────
+  # Networking
+  # ─────────────────────────────────────────────────────────────────
+  # #774: all networking resources below are gated on CreateVpc.
+  # When an ExistingVpcId is supplied they're skipped entirely and
+  # the consumers (SG VpcId, ALB/ECS/RDS subnets, target-group
+  # VpcId) wire to the ExistingVpcId/ExistingSubnetIds params via
+  # !If [CreateVpc, …]. tg owns NO networking on the BYO path, so a
+  # stack delete leaves the operator's VPC/subnets untouched.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateVpc
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: tg-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateVpc
+    Properties:
+      Tags:
+        - Key: Name
+          Value: tg-igw
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # #480: 2-AZ hard floor (RDS DBSubnetGroup + ALB both require
+  # ≥2 AZs). AZs are picked from !GetAZs rather than hardcoded
+  # `${AWS::Region}a/b` letters — the latter break in regions
+  # whose AZ letters aren't a/b (e.g. us-west-1 = a/c). The
+  # `!Select [1, !GetAZs '']` reference for the *B subnets makes
+  # a single-AZ region FAIL FAST at deploy ("index 1 out of
+  # range") instead of silently degrading to one AZ.
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: tg-public-a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: tg-public-b
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: tg-private-a
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: tg-private-b
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: tg-public-rt
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateVpc
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetA
+
+  PublicSubnetBRta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetB
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: CreateVpc
+    DependsOn: IgwAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: tg-nat-eip
+
+  # #480: teardown-ordering guard for the ENI/NAT hang. On stack
+  # DELETE, CFN tears down in reverse-dependency order. The ECS
+  # services (below) DependsOn PrivateDefaultRoute/PublicDefaultRoute,
+  # and those routes reference this NAT + the IGW — so the deletion
+  # chain is: ECS services (release their Fargate ENIs) → routes →
+  # NAT/IGW → subnets. Without that chain CFN races to delete the
+  # subnets/NAT while task ENIs still occupy them and hangs to the
+  # stack-timeout. The explicit DependsOn here (NAT → its public
+  # subnet + IGW attachment) keeps the NAT alive until routing is
+  # gone and pins create-order so the EIP/NAT/route triple can't
+  # half-build.
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateVpc
+    DependsOn:
+      - IgwAttachment
+      - PublicSubnetARta
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: tg-nat
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: tg-private-rt
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateVpc
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetA
+
+  PrivateSubnetBRta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetB
+
+  # ─────────────────────────────────────────────────────────────────
+  # Security groups
+  # ─────────────────────────────────────────────────────────────────
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >-
+        tg-alb ingress 80, locked to AllowedIngressCidr1..4
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref ExistingVpcId]
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all egress
+      Tags:
+        - Key: Name
+          Value: tg-alb-sg
+
+  AlbSGIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: Cidr1Set
+    Properties:
+      GroupId: !Ref AlbSG
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: !Ref AllowedIngressCidr1
+      Description: HTTP from AllowedIngressCidr1
+
+  AlbSGIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: Cidr2Set
+    Properties:
+      GroupId: !Ref AlbSG
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: !Ref AllowedIngressCidr2
+      Description: HTTP from AllowedIngressCidr2
+
+  AlbSGIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: Cidr3Set
+    Properties:
+      GroupId: !Ref AlbSG
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: !Ref AllowedIngressCidr3
+      Description: HTTP from AllowedIngressCidr3
+
+  AlbSGIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: Cidr4Set
+    Properties:
+      GroupId: !Ref AlbSG
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: !Ref AllowedIngressCidr4
+      Description: HTTP from AllowedIngressCidr4
+
+  AlbSGIngress1Tls:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: Cidr1AlbTls
+    Properties:
+      GroupId: !Ref AlbSG
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref AllowedIngressCidr1
+      Description: HTTPS from AllowedIngressCidr1
+
+  AlbSGIngress2Tls:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: Cidr2AlbTls
+    Properties:
+      GroupId: !Ref AlbSG
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref AllowedIngressCidr2
+      Description: HTTPS from AllowedIngressCidr2
+
+  AlbSGIngress3Tls:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: Cidr3AlbTls
+    Properties:
+      GroupId: !Ref AlbSG
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref AllowedIngressCidr3
+      Description: HTTPS from AllowedIngressCidr3
+
+  AlbSGIngress4Tls:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: Cidr4AlbTls
+    Properties:
+      GroupId: !Ref AlbSG
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref AllowedIngressCidr4
+      Description: HTTPS from AllowedIngressCidr4
+
+  ApiSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: tg-api ingress 8000 from ALB only
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref ExistingVpcId]
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all egress (ECR, RDS, AWS APIs)
+      Tags:
+        - Key: Name
+          Value: tg-api-sg
+
+  # #497: the api SG only ever takes :8000 from the ALB now —
+  # the EnableAlb=false public-task-IP direct-CIDR ingress
+  # (ApiSGIngressFromCidr1..4) is retired.
+  ApiSGIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ApiSG
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      SourceSecurityGroupId: !Ref AlbSG
+      Description: 8000 from ALB only
+
+  RdsSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: tg-rds ingress 5432 from api/worker only
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref ExistingVpcId]
+      Tags:
+        - Key: Name
+          Value: tg-rds-sg
+
+  RdsSGIngressFromApi:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSG
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ApiSG
+      Description: 5432 from api/worker SG
+
+  # ─────────────────────────────────────────────────────────────────
+  # Secrets Manager — RDS master password
+  # ─────────────────────────────────────────────────────────────────
+  DBPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}-db-password
+      Description: tg RDS master password (auto-generated)
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludePunctuation: false
+        ExcludeCharacters: "'\"\\/@: "
+        IncludeSpace: false
+
+  # #432: OIDC client secret in Secrets Manager. CFN seeds a
+  # placeholder on CREATE only (GenerateSecretString never runs
+  # on UPDATE), then the installer writes the real value via
+  # `put-secret-value`. Because the live value lives here — not
+  # in a CFN parameter — a secret-unset redeploy preserves it
+  # naturally, with no `UsePreviousValue` directive to mistake
+  # for a literal. The api task def reads it via `Secrets:`, so
+  # it's never plaintext in the task definition either.
+  OidcClientSecretManaged:
+    Type: AWS::SecretsManager::Secret
+    Condition: RequireLoginEnabled
+    Properties:
+      Name: !Sub ${AWS::StackName}-oidc-client-secret
+      Description: >
+        OIDC client secret (set by tg-ecs-install.sh via
+        put-secret-value; CFN only seeds a placeholder).
+      GenerateSecretString:
+        PasswordLength: 16
+        ExcludePunctuation: true
+
+  # ─────────────────────────────────────────────────────────────────
+  # RDS Postgres
+  # ─────────────────────────────────────────────────────────────────
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    # #774: the explicit DependsOn on the (now-conditional) private
+    # subnets was redundant — the SubnetIds !If below already refs
+    # them, which orders create-new correctly; on BYO they don't
+    # exist. CFN rejects a DependsOn→conditioned-out resource, so
+    # the ref-implied ordering is the right mechanism here.
+    Properties:
+      DBSubnetGroupDescription: tg-rds private subnets
+      # #774: created private subnets, or the BYO subnet list.
+      SubnetIds: !If
+        - CreateVpc
+        - [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        - !Ref ExistingSubnetIds
+      Tags:
+        - Key: Name
+          Value: tg-db-subnet-group
+
+  # #406: two gated DB definitions. DeletionPolicy /
+  # UpdateReplacePolicy are static resource attributes — they
+  # cannot be driven by !If — and acceptance needs BOTH a
+  # Snapshot variant (protected) and a Delete variant
+  # (disposable), so the only technique that satisfies both is
+  # two resources behind mutually-exclusive Conditions. Only
+  # the matching one is created.
+  #
+  # The PROTECTED resource keeps logical id `Database` and
+  # identifier ${AWS::StackName}-db — the same as the
+  # pre-#406 single resource — so an existing stage/prod stack
+  # gets an in-place property update (flip DeletionProtection
+  # on, bump backups; policy attrs are metadata, no replace),
+  # NOT a data-destroying replacement.
+  Database:
+    Type: AWS::RDS::DBInstance
+    Condition: DbProtected
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    DependsOn:
+      - DBSubnetGroup
+      - RdsSG
+    Properties:
+      DBInstanceIdentifier: !Sub ${AWS::StackName}-db
+      Engine: postgres
+      EngineVersion: '16'
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: '20'
+      StorageType: gp3
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBName: tg
+      MasterUsername: tg
+      MasterUserPassword:
+        !Sub '{{resolve:secretsmanager:${DBPasswordSecret}:SecretString:::}}'
+      Port: 5432
+      VPCSecurityGroups:
+        - !Ref RdsSG
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: 7
+      DeletionProtection: true
+      StorageEncrypted: true
+
+  # The DISPOSABLE resource (dev / fresh clones) uses a
+  # distinct identifier (${AWS::StackName}-db-dev) so a rare
+  # protected↔disposable flip can never hit a same-physical-
+  # name create-before-delete collision (cf. #402).
+  DatabaseDisposable:
+    Type: AWS::RDS::DBInstance
+    Condition: DbDisposable
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    DependsOn:
+      - DBSubnetGroup
+      - RdsSG
+    Properties:
+      DBInstanceIdentifier: !Sub ${AWS::StackName}-db-dev
+      Engine: postgres
+      EngineVersion: '16'
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: '20'
+      StorageType: gp3
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBName: tg
+      MasterUsername: tg
+      MasterUserPassword:
+        !Sub '{{resolve:secretsmanager:${DBPasswordSecret}:SecretString:::}}'
+      Port: 5432
+      VPCSecurityGroups:
+        - !Ref RdsSG
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      StorageEncrypted: true
+
+  # ─────────────────────────────────────────────────────────────────
+  # ECR repo
+  # ─────────────────────────────────────────────────────────────────
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: tg-container
+      # #797: empty the repo on stack delete. The installer pushes
+      # images into this repo, so without EmptyOnDelete CFN strands the
+      # delete ("repository … still contains images") → DELETE_FAILED →
+      # the next install's changeset is rejected ("Stack is in
+      # DELETE_FAILED state"). EmptyOnDelete lets CFN purge the images
+      # itself so teardown → re-install iterates cleanly. (tg destroy
+      # also pre-empties as a belt-and-suspenders, but rollback deletes
+      # don't run that path — the template-level flag covers both.)
+      EmptyOnDelete: true
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: false
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 5 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # ─────────────────────────────────────────────────────────────────
+  # CloudWatch Logs
+  # ─────────────────────────────────────────────────────────────────
+  TaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/tg-container
+      # #583: configurable app-log retention, default 7 days.
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ─────────────────────────────────────────────────────────────────
+  # IAM — task execution + task roles
+  # ─────────────────────────────────────────────────────────────────
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-task-exec
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: tg-task-exec-extras
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadDbSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref DBPasswordSecret
+              # #432: execution role pulls the OIDC secret at
+              # task launch to inject TG_OIDC_CLIENT_SECRET.
+              # Gated on RequireLoginEnabled — the secret only
+              # exists when login is on.
+              - !If
+                - RequireLoginEnabled
+                - Sid: ReadOidcSecret
+                  Effect: Allow
+                  Action:
+                    - secretsmanager:GetSecretValue
+                    - secretsmanager:DescribeSecret
+                  Resource: !Ref OidcClientSecretManaged
+                - !Ref AWS::NoValue
+
+  # #590 (#566C): the single backend role. Was
+  # ${AWS::StackName}-task; renamed to tg-app when the role
+  # consolidation collapsed tg-ApiRunner into the task role —
+  # the api/worker now query Athena/CUR under THIS role's creds
+  # directly (no assume-hop). The CUR/Athena query perms are
+  # the AthenaCurQueries / GlueCatalogReadForCur /
+  # S3ReadForCurAndAthena Sids below.
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: tg-app
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: tg-task-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # SigV4 auth uses GetCallerIdentity (always allowed for
+              # any role, but listed here for clarity)
+              - Sid: StsCallerIdentity
+                Effect: Allow
+                Action: sts:GetCallerIdentity
+                Resource: '*'
+
+              - Sid: AssumeTokenConsumerForTesting
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${TokenConsumerRoleName}
+
+              # #590: the AssumeApiRunner statement was removed
+              # with the role consolidation — the api queries
+              # Athena/CUR under this role's own creds now (see
+              # the AthenaCurQueries / GlueCatalogReadForCur /
+              # S3ReadForCurAndAthena Sids below), so there's no
+              # second role to assume.
+
+              # #725 (#720 slice 3): BedrockInvocationLogsInsights
+              # grant (logs:StartQuery/GetQueryResults on the
+              # invocation log group) retired — metrics_aggregator
+              # is deleted and CUR/Athena is the sole spend source.
+
+              - Sid: ManageQuotaDenyPolicy
+                Effect: Allow
+                Action:
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:ListPolicyVersions
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:policy/${DenyPolicyName}
+
+              # #640: #627's manage/unmanage attaches/detaches the
+              # tg-BedrockQuotaDeny MANAGED policy onto the role a
+              # discovered principal assumes. The statement above
+              # only lets the reconciler rewrite the deny's CONTENT
+              # (policy versions); attaching it to a role needs
+              # iam:AttachRolePolicy, and the unmanage path
+              # (detach-when-last) needs iam:DetachRolePolicy —
+              # both were missing, so #627 Manage 502'd on the
+              # first real (stage) deploy (#475 rollback).
+              #
+              # Resource: '*' is the GOVERNED role (discovered at
+              # runtime, unknown at deploy time). The hard scope is
+              # the iam:PolicyARN condition: the task role may
+              # attach/detach ONLY tg-BedrockQuotaDeny — a Deny
+              # policy — so worst case it over-restricts; it can
+              # never grant Bedrock or escalate. Matches #627's
+              # design note (scope the attach to the deny policy).
+              - Sid: AttachQuotaDenyToGovernedRoles
+                Effect: Allow
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                Resource: '*'
+                Condition:
+                  ArnEquals:
+                    iam:PolicyARN:
+                      !Sub arn:aws:iam::${AWS::AccountId}:policy/${DenyPolicyName}
+
+              # Govern of an IDC (AWSReservedSSO_*) developer wires that
+              # dev's SSO role into tg-consumer's trust so the
+              # per-principal QuotaDeny — which lives on tg-consumer, the
+              # durable chokepoint — actually evaluates for them (the deny
+              # can't sit on the IDC role itself: wiped on re-provision).
+              # This needs GetRole (read the current trust) +
+              # UpdateAssumeRolePolicy (rewrite it) on tg-consumer ONLY —
+              # NOT iam:* and NOT any other role. It adds who-may-assume,
+              # never a Bedrock grant; worst case it lets a governed dev
+              # reach the role where the deny then applies.
+              - Sid: WireIdcTrustOnTokenConsumer
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:UpdateAssumeRolePolicy
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${TokenConsumerRoleName}
+
+              # #732 (#649): the governance-drift sweep
+              # (governance.verify) reads each discovered principal's
+              # role to check whether the deny is actually attached.
+              # Strictly READ-ONLY (returns attached-policy ARNs) — no
+              # escalation, so unlike the attach/detach block it needs
+              # no iam:PolicyARN condition (that condition keys on the
+              # policy being attached, which doesn't apply to a list
+              # call). Resource '*' because governed roles are
+              # discovered at runtime (same rationale as the attach
+              # block above). Without this grant the sweep skips-loud
+              # and the drift badge sits at count:0 forever.
+              - Sid: GovernanceDriftRead
+                Effect: Allow
+                Action:
+                  - iam:ListAttachedRolePolicies
+                Resource: '*'
+
+              # #813 (#809): the deny_reconciler's detach-orphan pass
+              # calls iam:ListEntitiesForPolicy to find which roles
+              # tg-BedrockQuotaDeny is currently attached to, so it can
+              # detach it from roles no governed user assumes anymore.
+              # Without this grant the reconciler degrades gracefully
+              # (catches AccessDenied, still runs the ATTACH pass) but
+              # the detach-orphan cleanup silently no-ops. Read-only
+              # (returns the entities a policy is attached to) — no
+              # escalation; scoped to the deny-policy ARN as Resource
+              # (ListEntitiesForPolicy keys on the policy resource).
+              - Sid: ListQuotaDenyAttachments
+                Effect: Allow
+                Action:
+                  - iam:ListEntitiesForPolicy
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:policy/${DenyPolicyName}
+
+              - Sid: BedrockInvokeForAlerting
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${SonnetProfileId}
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${HaikuProfileId}
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${OpusProfileId}
+
+              # #354: auto-pricing pipeline reads AWS
+              # Pricing API (no resource scoping available
+              # for the pricing service) and the Bedrock
+              # model lifecycle to mark legacy/EOL models.
+              - Sid: PricingApiAndBedrockModelList
+                Effect: Allow
+                Action:
+                  - pricing:GetProducts
+                  - bedrock:ListFoundationModels
+                Resource: '*'
+
+              # Bedrock invocation-logging config toggle: an admin
+              # enabling/disabling the analytics capture stream from
+              # Settings calls Get/Put/Delete on the per-region logging
+              # SINGLETON. Read-first (Get) so tg only enables when no
+              # config is already present — it never clobbers a config
+              # the customer runs independently. Small, scoped grant;
+              # the actual data write is the S3 bucket policy, not this
+              # role. (No Resource restriction — the config is an
+              # account/Region singleton, not an ARN-scoped resource.)
+              - Sid: BedrockInvocationLoggingConfig
+                Effect: Allow
+                Action:
+                  - bedrock:GetModelInvocationLoggingConfiguration
+                  - bedrock:PutModelInvocationLoggingConfiguration
+                  - bedrock:DeleteModelInvocationLoggingConfiguration
+                Resource: '*'
+
+              - Sid: ReadDbSecretAtRuntime
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref DBPasswordSecret
+
+              # #762: SesSendAlertEmail removed with the
+              # quota_monitor email path (Option B). The in-app
+              # quota display is the alert surface; no outbound
+              # email, so the SES grant is dead.
+
+              # Athena/Glue/S3 read for CUR queries. #590: these
+              # are the api's DIRECT query perms now (the
+              # tg-ApiRunner assume-hop was collapsed into this
+              # role). Only useful if tg-cur-athena is also
+              # deployed; perms are harmless otherwise.
+              - Sid: AthenaCurQueries
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - athena:ListQueryExecutions
+                  - athena:GetWorkGroup
+                  - athena:ListNamedQueries
+                  - athena:GetNamedQuery
+                  - athena:BatchGetNamedQuery
+                  - athena:CreateNamedQuery
+                Resource: '*'
+
+              - Sid: GlueCatalogReadForCur
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource: '*'
+
+              - Sid: S3ReadForCurAndAthena
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::tg-cur-${AWS::AccountId}-${AWS::Region}
+                  - !Sub arn:aws:s3:::tg-cur-${AWS::AccountId}-${AWS::Region}/*
+                  - !Sub arn:aws:s3:::tg-athena-results-${AWS::AccountId}-${AWS::Region}
+                  - !Sub arn:aws:s3:::tg-athena-results-${AWS::AccountId}-${AWS::Region}/*
+                  # CUR reuse path: when the installer reuses an
+                  # existing (customer-owned, account-local) export,
+                  # the task role must read that bucket too — the CUR
+                  # data lives there, not in tg's own bucket. Added
+                  # only when ReusedCurBucketArn is set (minimum grant:
+                  # read-only on exactly the one operator-chosen bucket).
+                  - !If
+                    - HasReusedCurBucket
+                    - !Ref ReusedCurBucketArn
+                    - !Ref AWS::NoValue
+                  - !If
+                    - HasReusedCurBucket
+                    - !Sub ${ReusedCurBucketArn}/*
+                    - !Ref AWS::NoValue
+
+  # #346: per-role budget enforcement on tagged service
+  # roles. Attached only when EnableServiceAccountBudgets
+  # is 'true' so customers must opt in to giving TG
+  # IAM-write perms. Action list is exhaustively
+  # iam:PutRolePolicy / iam:DeleteRolePolicy /
+  # iam:ListRoleTags — no Attach*, no Tag*, no Pass*. The
+  # tg-budget-enforced=true tag on the target role is the
+  # customer's opt-in signal; AWS doesn't support
+  # iam:PolicyName as a condition key on PutRolePolicy so
+  # the only viable scoping is aws:ResourceTag.
+  ServiceAccountBudgetEnforcementPolicy:
+    Type: AWS::IAM::Policy
+    Condition: ServiceAccountBudgetsEnabled
+    Properties:
+      PolicyName: tg-service-account-budget-enforcement
+      Roles:
+        - !Ref EcsTaskRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ServiceBudgetWriteTagged
+            Effect: Allow
+            Action:
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+            Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/*
+            Condition:
+              StringEquals:
+                aws:ResourceTag/tg-budget-enforced: 'true'
+          - Sid: ServiceBudgetReadTags
+            Effect: Allow
+            Action:
+              - iam:ListRoleTags
+            Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/*
+
+  # #357: one-click "Send Cognito invite" admin
+  # provisioning. Attached only when
+  # EnableCognitoAdminProvisioning is 'true' so Okta /
+  # desktop installs never carry the Cognito-write perm.
+  # Scoped to CognitoUserPoolArn — the task role can only
+  # create / read / group users in this one pool, never
+  # any other pool in the account.
+  CognitoAdminProvisioningPolicy:
+    Type: AWS::IAM::Policy
+    Condition: CognitoAdminProvisioningEnabled
+    Properties:
+      PolicyName: tg-cognito-admin-provisioning
+      Roles:
+        - !Ref EcsTaskRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CognitoAdminProvisionUsers
+            Effect: Allow
+            Action:
+              - cognito-idp:AdminCreateUser
+              - cognito-idp:AdminGetUser
+              - cognito-idp:AdminAddUserToGroup
+            Resource: !Ref CognitoUserPoolArn
+
+  # Runtime SAML-IdP management. Attached whenever a pool ARN is
+  # supplied so the org-admin can wire/rename/remove a SAML IdP from
+  # Settings → Authentication with no redeploy. Scoped to this one pool
+  # (no '*'): the task role can manage identity providers + the app
+  # client on THIS pool only, never any other pool in the account. New
+  # privileged surface — gated to org-admin endpoints + audit-logged in
+  # the app layer (an app RCE could otherwise reconfigure auth).
+  CognitoSamlManagementPolicy:
+    Type: AWS::IAM::Policy
+    Condition: CognitoPoolArnProvided
+    Properties:
+      PolicyName: tg-cognito-saml-management
+      Roles:
+        - !Ref EcsTaskRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CognitoManageSamlIdp
+            Effect: Allow
+            Action:
+              - cognito-idp:CreateIdentityProvider
+              - cognito-idp:UpdateIdentityProvider
+              - cognito-idp:DeleteIdentityProvider
+              - cognito-idp:DescribeIdentityProvider
+              - cognito-idp:DescribeUserPool
+              - cognito-idp:DescribeUserPoolClient
+              - cognito-idp:UpdateUserPoolClient
+            Resource: !Ref CognitoUserPoolArn
+
+  # ─────────────────────────────────────────────────────────────────
+  # ECS cluster + task defs + services
+  # ─────────────────────────────────────────────────────────────────
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: tg-cluster
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  ApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    # #406: the DB_HOST/DB_PORT !GetAtt on whichever Database
+    # resource is active already creates an implicit dependency,
+    # so an explicit `- Database` DependsOn (which would dangle
+    # when the disposable variant is active) isn't needed.
+    DependsOn:
+      - TaskLogGroup
+    Properties:
+      Family: tg-api-task
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !If
+            - ImageUriProvided
+            - !Ref EcsImageUri
+            - !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/tg-container:latest
+          Essential: true
+          # 502 hardening: run 2 uvicorn workers so one blocked request
+          # (e.g. a Cost-Report Athena poll) can't starve the health
+          # endpoint served by the sibling worker. cpu=512 comfortably
+          # runs 2 workers. Connection budget: 2 workers x (pool 10 +
+          # overflow 20) x 2 tasks => up to 120 conns; confirm RDS
+          # max_connections headroom (or lower TG_DB_POOL_SIZE) at deploy.
+          Command:
+            - uvicorn
+            - api.main:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - '8000'
+            - --workers
+            - '2'
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          # Decouple container liveness from a single blocked process:
+          # ECS checks the cheap /api/version route (same path the ALB
+          # TG checks). A generous StartPeriod covers cold start; Timeout
+          # + Retries are loose so a transient slow request (an in-flight
+          # Athena poll on an older image) doesn't trip a kill. Uses
+          # python (always present in the python:3.12-slim runtime) — the
+          # slim image ships no curl/wget.
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - >-
+                python -c "import urllib.request,sys;
+                sys.exit(0 if urllib.request.urlopen(
+                'http://localhost:8000/api/version', timeout=5).status==200
+                else 1)"
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+          Environment:
+            - Name: AWS_ACCOUNT_ID
+              Value: !Ref AWS::AccountId
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            # #791: stamp the version at DEPLOY time. Overrides the
+            # image-baked TG_VERSION (Dockerfile build-arg) so the
+            # #553 image-skip path can't freeze a stale 'dev' string
+            # that breaks the version-keyed UAT dedup/trigger.
+            - Name: TG_VERSION
+              Value: !Ref TgVersion
+            # #791: the app warns if a non-dev env serves version=dev
+            # (the UAT contract breaker), so it needs the environment.
+            - Name: TG_ENVIRONMENT
+              Value: !Ref Environment
+            # #583: structured JSON app logs → CloudWatch.
+            - Name: TG_LOG_FORMAT
+              Value: json
+            # #595: env-driven level (default INFO; DEBUG to debug).
+            - Name: TG_LOG_LEVEL
+              Value: !Ref LogLevel
+            - Name: ROLE_NAME_FILTER
+              Value: !Ref RoleNameFilter
+            - Name: DENY_POLICY_NAME
+              Value: !Ref DenyPolicyName
+            - Name: TG_TOKEN_CONSUMER_ROLE_NAME
+              Value: !Ref TokenConsumerRoleName
+            - Name: BOOTSTRAP_ADMIN_EMAIL
+              Value: !Ref BootstrapAdminEmail
+            - Name: TG_INVLOGS_REGIONS
+              Value: !Ref InvocationLogRegions
+            - Name: ALLOWED_DOMAINS
+              Value: !Ref AllowedDomains
+            - Name: TG_AUTH_TEST_TRUST
+              Value: !If [TestAuthTrustEnabled, '1', '0']
+            - Name: TG_AUTH_REQUIRE_LOGIN
+              Value: !If [RequireLoginEnabled, '1', '0']
+            - Name: TG_OIDC_ISSUER
+              Value: !Ref OidcIssuer
+            - Name: TG_OIDC_CLIENT_ID
+              Value: !Ref OidcClientId
+            # #432: TG_OIDC_CLIENT_SECRET is injected via the
+            # `Secrets:` block below (Secrets Manager ref), not
+            # as a plaintext env Value.
+            - Name: TG_OIDC_REDIRECT_URI
+              Value: !Ref OidcRedirectUri
+            # #357: Cognito admin provisioning. TG_AUTH_PROVIDER
+            # gates both the API's AdminCreateUser path and the
+            # UI's "Send invite" checkbox; it is only 'cognito'
+            # when EnableCognitoAdminProvisioning=true.
+            - Name: TG_AUTH_PROVIDER
+              Value: !If [CognitoAdminProvisioningEnabled, 'cognito', '']
+            - Name: TG_COGNITO_USER_POOL_ID
+              Value: !Ref CognitoUserPoolId
+            - Name: DB_HOST
+              Value: !If [DbProtected, !GetAtt Database.Endpoint.Address, !GetAtt DatabaseDisposable.Endpoint.Address]
+            - Name: DB_PORT
+              Value: !If [DbProtected, !GetAtt Database.Endpoint.Port, !GetAtt DatabaseDisposable.Endpoint.Port]
+            - Name: DB_USER
+              Value: tg
+            - Name: DB_NAME
+              Value: tg
+            # CUR / Athena wiring (#195). Empty ATHENA_RESULTS_BUCKET
+            # is the documented "Cost Reports not configured" path.
+            - Name: ATHENA_RESULTS_BUCKET
+              Value: !Ref AthenaResultsBucket
+            - Name: ATHENA_WORKGROUP
+              Value: !Ref AthenaWorkgroup
+            - Name: ATHENA_DATABASE
+              Value: !Ref AthenaDatabase
+            - Name: CUR_TABLE_NAME
+              Value: !Ref CurTableName
+            # #590: TG_API_RUNNER_ROLE_ARN removed — the api
+            # queries CUR/Athena under its own task role (tg-app)
+            # now, so there's no runner-role ARN to wire.
+          # #432: TG_OIDC_CLIENT_SECRET joins DB_PASSWORD as a
+          # Secrets Manager ref when login is enabled. The
+          # OidcClientSecretManaged resource only exists under
+          # RequireLoginEnabled, so the !If swaps it out of the
+          # list when login is off (a !Ref to an absent resource
+          # would fail to synthesize).
+          Secrets: !If
+            - RequireLoginEnabled
+            - - Name: DB_PASSWORD
+                ValueFrom: !Ref DBPasswordSecret
+              - Name: TG_OIDC_CLIENT_SECRET
+                ValueFrom: !Ref OidcClientSecretManaged
+            - - Name: DB_PASSWORD
+                ValueFrom: !Ref DBPasswordSecret
+
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    # #406: the DB_HOST/DB_PORT !GetAtt on whichever Database
+    # resource is active already creates an implicit dependency,
+    # so an explicit `- Database` DependsOn (which would dangle
+    # when the disposable variant is active) isn't needed.
+    DependsOn:
+      - TaskLogGroup
+    Properties:
+      Family: tg-worker-task
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !If
+            - ImageUriProvided
+            - !Ref EcsImageUri
+            - !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/tg-container:latest
+          Essential: true
+          Command:
+            - python
+            - -m
+            - worker.main
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+          Environment:
+            - Name: AWS_ACCOUNT_ID
+              Value: !Ref AWS::AccountId
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            # #791: stamp the version at DEPLOY time. Overrides the
+            # image-baked TG_VERSION (Dockerfile build-arg) so the
+            # #553 image-skip path can't freeze a stale 'dev' string
+            # that breaks the version-keyed UAT dedup/trigger.
+            - Name: TG_VERSION
+              Value: !Ref TgVersion
+            # #791: the app warns if a non-dev env serves version=dev
+            # (the UAT contract breaker), so it needs the environment.
+            - Name: TG_ENVIRONMENT
+              Value: !Ref Environment
+            # #583: structured JSON app logs → CloudWatch.
+            - Name: TG_LOG_FORMAT
+              Value: json
+            # #595: env-driven level (default INFO; DEBUG to debug).
+            - Name: TG_LOG_LEVEL
+              Value: !Ref LogLevel
+            - Name: ROLE_NAME_FILTER
+              Value: !Ref RoleNameFilter
+            - Name: DENY_POLICY_NAME
+              Value: !Ref DenyPolicyName
+            - Name: TG_TOKEN_CONSUMER_ROLE_NAME
+              Value: !Ref TokenConsumerRoleName
+            - Name: BOOTSTRAP_ADMIN_EMAIL
+              Value: !Ref BootstrapAdminEmail
+            - Name: TG_INVLOGS_REGIONS
+              Value: !Ref InvocationLogRegions
+            - Name: ALLOWED_DOMAINS
+              Value: !Ref AllowedDomains
+            - Name: DB_HOST
+              Value: !If [DbProtected, !GetAtt Database.Endpoint.Address, !GetAtt DatabaseDisposable.Endpoint.Address]
+            - Name: DB_PORT
+              Value: !If [DbProtected, !GetAtt Database.Endpoint.Port, !GetAtt DatabaseDisposable.Endpoint.Port]
+            - Name: DB_USER
+              Value: tg
+            - Name: DB_NAME
+              Value: tg
+          Secrets:
+            - Name: DB_PASSWORD
+              ValueFrom: !Ref DBPasswordSecret
+
+  # ─────────────────────────────────────────────────────────────────
+  # ALB + target group + listener
+  # ─────────────────────────────────────────────────────────────────
+  # #774: Alb is forked create-new vs BYO — the ONLY difference is
+  # the create-new copy's `DependsOn: IgwAttachment` (an internet-
+  # facing ALB needs the IGW attached first; on BYO the operator's
+  # VPC already has its gateway, and IgwAttachment doesn't exist).
+  # CFN can't !If a DependsOn, hence two resources gated on the
+  # inverse conditions. Consumers !If [CreateVpc, !Ref Alb, !Ref
+  # AlbByo]. Keep the two bodies identical apart from Condition +
+  # DependsOn.
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: CreateVpc
+    # #797: delete-order the ALB BEFORE ApiTargetGroup. The listeners
+    # are DeletionPolicy: Retain (#421/#420), so CFN never deletes them
+    # — but deleting the ALB cascades its listeners at the AWS level,
+    # which is what frees the target group. Without this, CFN tried to
+    # delete ApiTargetGroup while the (retained) listener still
+    # forwarded to it → "currently in use by a listener" → DELETE_FAILED
+    # → next install blocked. CFN deletes a depender before its
+    # dependency, so Alb DependsOn ApiTargetGroup => Alb (and its
+    # listeners) go first. ApiTargetGroup is unconditional → valid dep.
+    DependsOn:
+      - IgwAttachment
+      - ApiTargetGroup
+    Properties:
+      # No explicit Name: let CFN auto-name. A fixed `tg-alb` collided
+      # with an ORPHANED physical tg-alb left by a prior rolled-back
+      # run (CFN can't import it mid-deploy) → CREATE_FAILED on re-run.
+      # A stack-name prefix wouldn't help (Alb/AlbByo share the stack,
+      # and an orphan of the same stack still collides); auto-naming is
+      # the only collision-proof, CFN-idiomatic option. The DNS is read
+      # from the AlbDnsName Output, never the literal name, so consumers
+      # are unaffected. (Trade-off: removing Name replaces the ALB once
+      # on the first deploy after this → new DNS; the installer already
+      # reconciles the Cognito callback / OidcRedirectUri from the
+      # AlbDnsName Output on every deploy, so that heals automatically.)
+      Scheme: !Ref AlbScheme
+      Type: application
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref AlbSG
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+
+  AlbByo:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: UseExistingVpc
+    # #797: same delete-ordering as Alb — the ALB must delete (and
+    # cascade-free its retained listeners) before ApiTargetGroup, or
+    # CFN strands on "target group in use by a listener". BYO has no
+    # IgwAttachment dep (operator's VPC owns its gateway).
+    DependsOn: ApiTargetGroup
+    Properties:
+      # Auto-named (no explicit Name:) — same rationale as Alb above:
+      # avoid the orphaned-tg-alb collision on a re-run after a prior
+      # rolled-back BYO install. DNS comes from the AlbDnsName Output.
+      Scheme: !Ref AlbScheme
+      Type: application
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref AlbSG
+      # BYO subnet list (operator picks ≥2 AZs; ALB scheme + SG
+      # allowlist govern reachability; their VPC owns egress).
+      Subnets: !Ref ExistingSubnetIds
+
+  ApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      # Auto-named (no explicit Name:) — a fixed tg-api-tg collided with
+      # an orphan from a prior rolled-back run (the #853 demo2
+      # "tg-api-tg already exists"). The listener forwards to it by Ref,
+      # not by name, so auto-naming is transparent.
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref ExistingVpcId]
+      Protocol: HTTP
+      Port: 8000
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /api/version
+      HealthCheckPort: '8000'
+      HealthCheckIntervalSeconds: 15
+      # 502 hardening: loosen the TG health check so a brief stall (e.g.
+      # an in-flight Athena poll on an older single-worker image) rides
+      # through instead of immediately deregistering the task. Timeout
+      # 5->10s; unhealthy threshold 3->5 (≈5x15s of sustained failure
+      # before deregistration, not ~45s).
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '15'
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    # #421/#420: Retain so a CIDR/SG-driven stack update can
+    # never delete or replace the listener as a cleanup
+    # side-effect (the #415 SG change silently swept both
+    # listeners, taking stage down ~45 min). DeletionPolicy
+    # covers logical-resource removal; UpdateReplacePolicy
+    # covers the replace path that actually bit us.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LoadBalancerArn: !If [CreateVpc, !Ref Alb, !Ref AlbByo]
+      Protocol: HTTP
+      Port: 80
+      DefaultActions: !If
+        - TlsEnabled
+        - - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: '443'
+              Host: '#{host}'
+              Path: /#{path}
+              Query: '#{query}'
+              StatusCode: HTTP_301
+        - - Type: forward
+            TargetGroupArn: !Ref ApiTargetGroup
+
+  # Auto-issued ACM cert (DNS validation in HostedZoneId).
+  # Only created when IssueAcmCert=true and the operator
+  # didn't already pass a CertificateArn. Stack creation
+  # blocks until DNS validation completes (~3-5 min).
+  IssuedCert:
+    Type: AWS::CertificateManager::Certificate
+    Condition: IssueCertEnabled
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - Key: tg-stack
+          Value: tg-container-stack
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: TlsEnabled
+    # #421/#420: Retain — see HttpListener above. A CIDR/SG
+    # update must never delete or replace the listener.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LoadBalancerArn: !If [CreateVpc, !Ref Alb, !Ref AlbByo]
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !If
+            - CertArnProvided
+            - !Ref CertificateArn
+            - !Ref IssuedCert
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ApiTargetGroup
+
+  Route53Alias:
+    Type: AWS::Route53::RecordSet
+    Condition: RouteAliasEnabled
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !If [CreateVpc, !GetAtt Alb.DNSName, !GetAtt AlbByo.DNSName]
+        HostedZoneId: !If [CreateVpc, !GetAtt Alb.CanonicalHostedZoneID, !GetAtt AlbByo.CanonicalHostedZoneID]
+        EvaluateTargetHealth: false
+
+  # ─────────────────────────────────────────────────────────────────
+  # ECS Services
+  # ─────────────────────────────────────────────────────────────────
+  # #774: ApiService is forked create-new vs BYO. The ONLY
+  # difference is the create-new copy's DependsOn on the route
+  # resources (PrivateDefaultRoute/PublicDefaultRoute) — the #480
+  # ENI/NAT teardown-ordering guard (Service ENIs must detach
+  # before the NAT/routes delete). On BYO tg created no NAT/route,
+  # so that guard is N/A; the #532 HttpListener DependsOn stays
+  # (listener-ordering is independent of VPC ownership). CFN can't
+  # !If a DependsOn → two resources on inverse conditions; the
+  # Properties bodies are otherwise identical. Consumers
+  # !If [CreateVpc, !Ref ApiService, !Ref ApiServiceByo].
+  ApiService:
+    Type: AWS::ECS::Service
+    Condition: CreateVpc
+    DependsOn:
+      - PrivateDefaultRoute
+      - PublicDefaultRoute
+      # #532: a target group is only "associated with a load
+      # balancer" once a listener forwards to it. Without this,
+      # CFN may update ApiService (which registers ApiTargetGroup
+      # via LoadBalancers) BEFORE the listener attaches the TG to
+      # the ALB → ECS rejects the registration → the #475 3rd-fail
+      # rollback. HttpListener is unconditional, so it's a valid
+      # static DependsOn. (In TLS mode HttpListener redirects and
+      # HttpsListener does the forward; HttpsListener is
+      # conditional so it can't be listed here — but it's Retain'd
+      # and the two-pass DesiredCount=0 create means the forward
+      # listener already exists by the pass-2 scale-up. Worth
+      # confirming on the TLS path when validating an HTTPS deploy.)
+      - HttpListener
+    Properties:
+      ServiceName: tg-api-service
+      Cluster: !Ref EcsCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref ApiTaskDefinition
+      DeploymentConfiguration:
+        # 502 hardening: keep >=1 api task healthy through a rolling
+        # deploy. With DesiredCount=2, 50% leaves one task serving the
+        # ALB while the other replaces (the 0%+single-task swap left
+        # ZERO healthy targets → the 502). Scoped to the API service —
+        # the worker (not behind the ALB) stays at 0%.
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # #497: ALB-only — api task has no public IP and runs
+          # in the private subnets behind the ALB.
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ApiSG
+          Subnets:
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetB
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8000
+          TargetGroupArn: !Ref ApiTargetGroup
+      HealthCheckGracePeriodSeconds: 60
+
+  ApiServiceByo:
+    Type: AWS::ECS::Service
+    Condition: UseExistingVpc
+    # #774 BYO: no route/IGW DependsOn (tg owns no NAT/route to
+    # order-delete); KEEP HttpListener (the #532 guard).
+    DependsOn:
+      - HttpListener
+    Properties:
+      ServiceName: tg-api-service
+      Cluster: !Ref EcsCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref ApiTaskDefinition
+      DeploymentConfiguration:
+        # 502 hardening (BYO-VPC path): same as ApiService — keep >=1
+        # api task healthy through a rolling deploy (DesiredCount=2).
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !Ref AssignTaskPublicIp
+          SecurityGroups:
+            - !Ref ApiSG
+          Subnets: !Ref ExistingSubnetIds
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8000
+          TargetGroupArn: !Ref ApiTargetGroup
+      HealthCheckGracePeriodSeconds: 60
+
+  # #774: WorkerService forked — create-new keeps the #480
+  # PrivateDefaultRoute teardown guard; BYO has no networking
+  # DependsOn (no listener dep either — the worker isn't behind
+  # the ALB).
+  WorkerService:
+    Type: AWS::ECS::Service
+    Condition: CreateVpc
+    DependsOn:
+      - PrivateDefaultRoute
+    Properties:
+      ServiceName: tg-worker-service
+      Cluster: !Ref EcsCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref WorkerTaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ApiSG
+          Subnets:
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetB
+
+  WorkerServiceByo:
+    Type: AWS::ECS::Service
+    Condition: UseExistingVpc
+    Properties:
+      ServiceName: tg-worker-service
+      Cluster: !Ref EcsCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref WorkerTaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !Ref AssignTaskPublicIp
+          SecurityGroups:
+            - !Ref ApiSG
+          Subnets: !Ref ExistingSubnetIds
+
+Outputs:
+  AlbDnsName:
+    Description: ALB DNS for hitting the api over HTTP
+    Value: !If [CreateVpc, !GetAtt Alb.DNSName, !GetAtt AlbByo.DNSName]
+    Export:
+      Name: !Sub ${AWS::StackName}-AlbDnsName
+
+  # #432: ARN of the OIDC client-secret in Secrets Manager. The
+  # installer writes the real value here via put-secret-value
+  # and reads it back on a secret-unset upgrade.
+  OidcClientSecretArn:
+    Condition: RequireLoginEnabled
+    Description: Secrets Manager ARN holding the OIDC client secret
+    Value: !Ref OidcClientSecretManaged
+    Export:
+      Name: !Sub ${AWS::StackName}-OidcClientSecretArn
+
+  ApiPublicEndpoint:
+    Description: >
+      URL to hit the api — the ALB DNS (or DomainName when a
+      Route53 alias is set), https when a cert is configured.
+    # #774: the ALB is forked (Alb / AlbByo) — pick the live one's
+    # DNS for the create-new vs BYO path.
+    Value: !If
+      - RouteAliasEnabled
+      - !Sub https://${DomainName}
+      - !If
+        - TlsEnabled
+        - !If
+          - CreateVpc
+          - !Sub https://${Alb.DNSName}
+          - !Sub https://${AlbByo.DNSName}
+        - !If
+          - CreateVpc
+          - !Sub http://${Alb.DNSName}
+          - !Sub http://${AlbByo.DNSName}
+
+  EcrRepositoryUri:
+    Description: Push container images here (tag :latest by default)
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}
+    Export:
+      Name: !Sub ${AWS::StackName}-EcrRepositoryUri
+
+  RdsEndpoint:
+    Description: Postgres endpoint as host:port
+    Value: !If
+      - DbProtected
+      - !Sub ${Database.Endpoint.Address}:${Database.Endpoint.Port}
+      - !Sub ${DatabaseDisposable.Endpoint.Address}:${DatabaseDisposable.Endpoint.Port}
+    Export:
+      Name: !Sub ${AWS::StackName}-RdsEndpoint
+
+  EcsClusterName:
+    Description: ECS cluster name
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub ${AWS::StackName}-EcsClusterName
+
+  EcsApiServiceName:
+    Description: API service name
+    Value: !If [CreateVpc, !GetAtt ApiService.Name, !GetAtt ApiServiceByo.Name]
+    Export:
+      Name: !Sub ${AWS::StackName}-EcsApiServiceName
+
+  EcsWorkerServiceName:
+    Description: Worker service name
+    Value: !If [CreateVpc, !GetAtt WorkerService.Name, !GetAtt WorkerServiceByo.Name]
+    Export:
+      Name: !Sub ${AWS::StackName}-EcsWorkerServiceName
+
+  LogGroupName:
+    Description: CloudWatch Logs group for both api + worker tasks
+    Value: !Ref TaskLogGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-LogGroupName

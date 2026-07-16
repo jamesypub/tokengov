@@ -1,0 +1,622 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CUR 2.0 export + Glue catalog + Athena workgroup for tg-admin spend
+  attribution. Deploys to us-east-1 only (CUR is a billing service, regional
+  to us-east-1). The CUR data is exposed via a STATIC Glue table with
+  partition projection (#591/#566E) — no crawler, no Glue service role:
+  new billing months resolve at query time.
+
+  Run via scripts/tg-cur-deploy.sh — it writes the resulting env vars
+  for tg-admin (no crawler kick needed).
+
+Metadata:
+  # Lockstep image<->template versioning: the MINIMUM container-image
+  # version required to run these templates. The installer reads the
+  # deployed image's org.tg.version label and refuses to deploy this
+  # stack against an OLDER image (the deploy-skew that surfaced as a raw
+  # Athena 'mismatched input {' when an image predating the report
+  # {{DATE_FILTER}} substitution served these named queries). Bump this
+  # ONLY when a template adds a feature the API must understand. Current
+  # floor 1.1.0: the named queries carry the {{DATE_FILTER}} token, which
+  # the API substitutes — support for it shipped in the 1.1.0 line.
+  TgMinImageVersion: '1.1.0'
+
+Parameters:
+  # #591 (#566D): AdminRoleName removed — it attached a CUR-query
+  # policy to tg-BedrockAdmin, which is deleted (desktop gone,
+  # #574/#576). #590 (#566C): the api queries CUR under its own
+  # task role (tg-app), which carries the CUR/Athena query perms
+  # inline (tg-container-stack.yaml).
+  ExportName:
+    Type: String
+    Default: tg-bedrock-cur
+    Description: Name of the CUR 2.0 export (alphanumeric + hyphens, <= 128 chars)
+
+  CurBucketName:
+    Type: String
+    Default: ''
+    Description: >
+      S3 bucket for raw CUR data. Leave empty to auto-name
+      tg-cur-<account>-<region>.
+
+  AthenaResultsBucketName:
+    Type: String
+    Default: ''
+    Description: >
+      S3 bucket for Athena query results. Leave empty to auto-name
+      tg-athena-results-<account>-<region>.
+
+  GlueDatabaseName:
+    Type: String
+    Default: tg_cur
+    Description: Glue database that will hold the CUR table
+
+  CurTableName:
+    Type: String
+    Default: data
+    Description: >
+      Name of the static Glue table (#591) over the CUR S3
+      prefix. BCM Data Exports CUR 2.0 always lands parquet
+      under .../<export>/data/, and the historical crawler
+      named the table 'data', so the default keeps existing
+      queries working. The api + SavedQuery reference this name.
+
+  AthenaWorkgroupName:
+    Type: String
+    Default: tg-cur-analytics
+
+  CreateExport:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      'true' (default): this stack creates tg's own CUR 2.0 export
+      (AWS::BCMDataExports::Export) and the Glue table reads from it.
+      'false' (REUSE path): the installer discovered a valid existing
+      CUR 2.0 export to reuse — skip creating an export, and point the
+      Glue table at the existing export's S3 location given in
+      ReusedCurS3Url. A customer's foreign export is never deleted; tg
+      only reads it.
+
+  ReusedCurS3Url:
+    Type: String
+    Default: ''
+    Description: >
+      REUSE path only (CreateExport=false). The S3 URL of the existing
+      export's delivered CUR 2.0 data, ending in the .../data/ prefix
+      that holds the BILLING_PERIOD=YYYY-MM partitions — e.g.
+      s3://acme-billing/cur/acme-cur/acme-cur/data/. The Glue table's
+      Location + partition-projection template point here instead of
+      tg's own bucket. Leave empty on the create path.
+
+Conditions:
+  AutoNameCurBucket:    !Equals [!Ref CurBucketName, '']
+  AutoNameAthenaBucket: !Equals [!Ref AthenaResultsBucketName, '']
+  # #591: HasAdminRole removed with the tg-BedrockAdmin CUR policy.
+  # Reuse-or-create: ShouldCreateExport gates tg's own
+  # AWS::BCMDataExports::Export resource; ReuseExternalCur switches the
+  # Glue table's S3 Location to the discovered external export.
+  ShouldCreateExport: !Equals [!Ref CreateExport, 'true']
+  ReuseExternalCur:   !Not [!Equals [!Ref ReusedCurS3Url, '']]
+
+Resources:
+  # ── S3 buckets ─────────────────────────────────────────────────────────
+  CurBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If
+        - AutoNameCurBucket
+        - !Sub tg-cur-${AWS::AccountId}-${AWS::Region}
+        - !Ref CurBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+
+  CurBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CurBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: BillingReportsWrite
+            Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action:
+              - s3:GetBucketAcl
+              - s3:GetBucketPolicy
+              - s3:ListBucket
+              - s3:PutObject
+            Resource:
+              - !GetAtt CurBucket.Arn
+              - !Sub ${CurBucket.Arn}/*
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:cur:us-east-1:${AWS::AccountId}:definition/*
+          - Sid: BcmExportsWrite
+            Effect: Allow
+            Principal:
+              Service: bcm-data-exports.amazonaws.com
+            Action:
+              - s3:GetBucketAcl
+              - s3:GetBucketPolicy
+              - s3:ListBucket
+              - s3:PutObject
+            Resource:
+              - !GetAtt CurBucket.Arn
+              - !Sub ${CurBucket.Arn}/*
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt CurBucket.Arn
+              - !Sub ${CurBucket.Arn}/*
+            Condition:
+              Bool: { aws:SecureTransport: 'false' }
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If
+        - AutoNameAthenaBucket
+        - !Sub tg-athena-results-${AWS::AccountId}-${AWS::Region}
+        - !Ref AthenaResultsBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireResults
+            Status: Enabled
+            ExpirationInDays: 14
+
+  # ── CUR 2.0 export (BCM Data Exports) ─────────────────────────────────
+  # Created only on the create path (CreateExport=true). On the reuse
+  # path the installer found a valid existing export, so tg creates no
+  # export of its own and the Glue table reads the external location.
+  CurExport:
+    Type: AWS::BCMDataExports::Export
+    Condition: ShouldCreateExport
+    # Retain the export across stack updates: a conditioned data resource
+    # with no Retain is deleted whenever its condition flips false (e.g. a
+    # redeploy that re-detects an existing export and sets CreateExport
+    # off). Without Retain that drops the export and leaves the account
+    # export-less — and CUR is the sole spend + governance source, so an
+    # export-less account silently loses all spend tracking and deny
+    # enforcement. Retain makes that flip non-destructive (mirrors the two
+    # S3 buckets above).
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: CurBucketPolicy
+    Properties:
+      Export:
+        Name: !Ref ExportName
+        Description: tg-admin per-user Bedrock spend attribution (CUR 2.0, IAM principal enabled)
+        DataQuery:
+          QueryStatement: >-
+            SELECT
+              identity_line_item_id,
+              identity_time_interval,
+              bill_billing_period_start_date,
+              bill_billing_period_end_date,
+              bill_payer_account_id,
+              line_item_usage_account_id,
+              line_item_line_item_type,
+              line_item_usage_start_date,
+              line_item_usage_end_date,
+              line_item_product_code,
+              line_item_usage_type,
+              line_item_operation,
+              line_item_resource_id,
+              line_item_user_identifier,
+              line_item_iam_principal,
+              line_item_usage_amount,
+              line_item_unblended_cost,
+              line_item_currency_code,
+              line_item_line_item_description,
+              product_servicecode,
+              product_region_code
+            FROM COST_AND_USAGE_REPORT
+          TableConfigurations:
+            COST_AND_USAGE_REPORT:
+              TIME_GRANULARITY: HOURLY
+              INCLUDE_RESOURCES: 'TRUE'
+              INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY: 'FALSE'
+              INCLUDE_SPLIT_COST_ALLOCATION_DATA: 'FALSE'
+              INCLUDE_IAM_PRINCIPAL_DATA: 'TRUE'
+        DestinationConfigurations:
+          S3Destination:
+            S3Bucket: !Ref CurBucket
+            S3Prefix: !Ref ExportName
+            S3Region: !Ref AWS::Region
+            S3OutputConfigurations:
+              Format: PARQUET
+              Compression: PARQUET
+              OutputType: CUSTOM
+              Overwrite: OVERWRITE_REPORT
+        RefreshCadence:
+          Frequency: SYNCHRONOUS
+
+  # ── Glue ───────────────────────────────────────────────────────────────
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: CUR 2.0 data for tg-admin spend attribution
+
+  # #591 (#566E): the Glue CRAWLER (+ its tg-cur-glue-crawler role
+  # and the start-crawler kick) is replaced by an explicit static
+  # AWS::Glue::Table with PARTITION PROJECTION. "Why a Glue role if
+  # I have Athena" (user) — a static table needs no crawler, no
+  # service role, and no daily discovery: new months resolve at
+  # query time from the projected partition. Smaller IAM surface
+  # (no glue.amazonaws.com service principal remains in this stack)
+  # and no crawler-lag window before a fresh month is queryable.
+  #
+  # Schema = the exact 20 columns the CurExport DataQuery selects
+  # (above), all CUR 2.0 string/decimal/timestamp types per the
+  # CUR 2.0 data dictionary. The data lands as PARQUET at
+  #   s3://<bucket>/<export>/<export>/data/BILLING_PERIOD=YYYY-MM/
+  # so we project the single `billing_period` partition over a
+  # year-month range. (Athena column names are the snake_case CUR
+  # 2.0 names; the SavedQuery + the api both already use them.)
+  # No hard DependsOn on CurExport: on the reuse path CurExport isn't
+  # created (Condition above), and CFN rejects a DependsOn on a
+  # conditionally-absent resource. The dependency was only a creation-
+  # ORDER nicety — the table reads S3 at query time, and CUR delivery
+  # is asynchronous (hours) regardless of resource order, so dropping
+  # it changes no real behaviour. On the create path the export + table
+  # still both land in one deploy.
+  CurGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: !Ref CurTableName
+        Description: >-
+          CUR 2.0 export, static table + partition projection
+          (#591/#566E — replaces the Glue crawler).
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          # Partition projection — new months resolve at query time,
+          # no crawler. Range starts at the pilot's first CUR month;
+          # 'NOW' keeps the upper bound current automatically.
+          projection.enabled: 'true'
+          projection.billing_period.type: date
+          projection.billing_period.range: '2025-01,NOW'
+          projection.billing_period.format: yyyy-MM
+          projection.billing_period.interval: '1'
+          projection.billing_period.interval.unit: MONTHS
+          # Reuse path points at the discovered external export's
+          # .../data/ prefix; create path uses tg's own bucket. The
+          # ${!billing_period} escapes !Sub so it stays a literal
+          # projection variable.
+          storage.location.template: !If
+            - ReuseExternalCur
+            - !Sub ${ReusedCurS3Url}BILLING_PERIOD=${!billing_period}
+            - !Sub s3://${CurBucket}/${ExportName}/${ExportName}/data/BILLING_PERIOD=${!billing_period}
+        PartitionKeys:
+          - { Name: billing_period, Type: string }
+        StorageDescriptor:
+          Location: !If
+            - ReuseExternalCur
+            - !Ref ReusedCurS3Url
+            - !Sub s3://${CurBucket}/${ExportName}/${ExportName}/data/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - { Name: identity_line_item_id,            Type: string }
+            - { Name: identity_time_interval,           Type: string }
+            - { Name: bill_billing_period_start_date,   Type: timestamp }
+            - { Name: bill_billing_period_end_date,     Type: timestamp }
+            - { Name: bill_payer_account_id,            Type: string }
+            - { Name: line_item_usage_account_id,       Type: string }
+            - { Name: line_item_line_item_type,         Type: string }
+            - { Name: line_item_usage_start_date,       Type: timestamp }
+            - { Name: line_item_usage_end_date,         Type: timestamp }
+            - { Name: line_item_product_code,           Type: string }
+            - { Name: line_item_usage_type,             Type: string }
+            - { Name: line_item_operation,              Type: string }
+            - { Name: line_item_resource_id,            Type: string }
+            - { Name: line_item_user_identifier,        Type: string }
+            - { Name: line_item_iam_principal,          Type: string }
+            - { Name: line_item_usage_amount,           Type: double }
+            - { Name: line_item_unblended_cost,         Type: double }
+            - { Name: line_item_currency_code,          Type: string }
+            - { Name: line_item_line_item_description,  Type: string }
+            - { Name: product_servicecode,              Type: string }
+            - { Name: product_region_code,              Type: string }
+
+  # ── Athena workgroup ───────────────────────────────────────────────────
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref AthenaWorkgroupName
+      Description: tg-admin CUR queries
+      State: ENABLED
+      # Without this, stack-delete fails when the workgroup
+      # has query history ("WorkGroup ... is not empty") —
+      # which it always has after even one Cost-Reports run.
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: false
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${AthenaResultsBucket}/results/
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EngineVersion:
+          SelectedEngineVersion: AUTO
+
+  # ── Saved query: per-user Bedrock spend ────────────────────────────────
+  SavedQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: tg-bedrock-spend-by-user
+      Description: Per-IAM-principal Bedrock spend, current month-to-date
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkgroup
+      QueryString: !Sub |
+        -- Per-user Bedrock spend, month-to-date.
+        -- CUR 2.0's line_item_iam_principal holds the IAM principal ARN
+        -- of whoever made the call (line_item_user_identifier is blank
+        -- for Bedrock — #714). For IDC-federated users, the ARN ends
+        -- in /<role>/<email>, so the last "/"-segment is the email.
+        -- Table name is the CurTableName CFN parameter (default 'data').
+        SELECT
+          REGEXP_EXTRACT(line_item_iam_principal, '/([^/]+)$', 1) AS email,
+          ROUND(SUM(line_item_unblended_cost), 4)                   AS actual_usd,
+          COUNT(*)                                                  AS line_items
+        FROM "${GlueDatabaseName}"."${CurTableName}"
+        WHERE line_item_product_code = 'AmazonBedrockService'
+          AND line_item_iam_principal IS NOT NULL
+          AND {{DATE_FILTER}}
+        GROUP BY 1
+        ORDER BY 2 DESC;
+
+  SavedQuerySpendByModel:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: tg-bedrock-spend-by-model
+      Description: Per-model Bedrock spend, current month-to-date
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkgroup
+      QueryString: !Sub |
+        -- Per-model Bedrock spend, month-to-date.
+        --
+        -- The model id comes from line_item_resource_id, NOT
+        -- usage_type: usage_type carries a region prefix + -mantle- +
+        -- cross-region token-type suffix that fragments one model
+        -- across many rows and reads as gibberish, not a model name.
+        -- Extract the model from the resource id exactly like the
+        -- per-(user, model) query (tg-bedrock-tokens-spend-by-user-model)
+        -- so the two reports agree token-for-token. The CRIS geo prefix
+        -- is KEPT, so global.* and us.* stay SEPARATE rows (the routing
+        -- split is intentional, not noise).
+        WITH base AS (
+          SELECT
+            COALESCE(
+              REGEXP_EXTRACT(line_item_resource_id,
+                '(?:inference-profile|foundation-model)/(.+)$', 1),
+              line_item_usage_type)                     AS model,
+            line_item_unblended_cost                    AS cost
+          FROM "${GlueDatabaseName}"."${CurTableName}"
+          WHERE line_item_product_code = 'AmazonBedrockService'
+            AND {{DATE_FILTER}}
+        )
+        SELECT model,
+               ROUND(SUM(cost), 4) AS actual_usd,
+               COUNT(*)            AS line_items
+        FROM base
+        GROUP BY 1
+        ORDER BY 2 DESC;
+
+  # Per-(user, model) token + cost breakdown across all four
+  # dimensions (input / output / cache-read / cache-write). A
+  # spend-only per-(user, model) report can't show WHY a model is
+  # expensive (e.g. a cache-heavy workload); this one splits cost AND
+  # token counts per dimension so the cost driver is visible — a strict
+  # superset of the old $-only report (#1124 removed that redundant
+  # one). Pinned first in the Cost Reports list (the API's
+  # featured-first sort) and the default view.
+  SavedQueryTokensSpendByUserModel:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: tg-bedrock-tokens-spend-by-user-model
+      Description: >-
+        Per-user, per-model token & cost, split by input / output /
+        cache. Month-to-date by default.
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkgroup
+      QueryString: !Sub |
+        -- Per-(user, model) cost AND token counts, split by the four
+        -- token dimensions. cur_user_spend (Postgres) has the token
+        -- columns but only TOTAL spend, not per-dimension cost — raw
+        -- CUR is the only source with cost-per-dimension, so this
+        -- reads the Glue table directly like the other named queries.
+        --
+        -- TWO load-bearing gotchas (verified against real CUR rows):
+        --
+        -- (1) Cache rows CONTAIN the 'input-token' substring (e.g.
+        --     '...cache-read-input-token-count-cross-region-global'),
+        --     so the input/output CASE branches MUST exclude cache
+        --     FIRST or cache rows get miscounted as input. This mirrors
+        --     the cache-before-input ordering in the worker's
+        --     cur_spend_sync._classify_token_dimension. '%cache-read%'
+        --     / '%cache-write%' match both observed naming schemes
+        --     (-mantle-cache-read and -cache-read-input-token-count).
+        --
+        -- (2) The model id comes from line_item_resource_id, NOT
+        --     usage_type — usage_type carries a region prefix + -mantle
+        --     + profile suffix that fragments one model across rows.
+        --     The CRIS geo prefix is KEPT, so global.* and us.* are
+        --     SEPARATE rows (the routing split is intentional, not
+        --     noise).
+        WITH base AS (
+          SELECT
+            REGEXP_EXTRACT(line_item_iam_principal, '/([^/]+)$', 1) AS usr,
+            COALESCE(
+              REGEXP_EXTRACT(line_item_resource_id,
+                '(?:inference-profile|foundation-model)/(.+)$', 1),
+              line_item_usage_type)                              AS model,
+            LOWER(line_item_usage_type)                          AS ut,
+            line_item_usage_amount                               AS amt,
+            line_item_unblended_cost                             AS cost
+          FROM "${GlueDatabaseName}"."${CurTableName}"
+          WHERE line_item_product_code = 'AmazonBedrockService'
+            AND line_item_iam_principal IS NOT NULL
+            AND {{DATE_FILTER}}
+        )
+        SELECT
+          usr   AS user,
+          model AS model,
+          ROUND(SUM(cost), 4)                                            AS total_spend,
+          ROUND(SUM(CASE WHEN ut LIKE '%cache%' THEN 0
+                         WHEN ut LIKE '%input-token%' THEN cost ELSE 0 END), 4)  AS input_spend,
+          ROUND(SUM(CASE WHEN ut LIKE '%output-token%' THEN cost ELSE 0 END), 4) AS output_spend,
+          ROUND(SUM(CASE WHEN ut LIKE '%cache-read%'  THEN cost ELSE 0 END), 4)  AS cache_read_spend,
+          ROUND(SUM(CASE WHEN ut LIKE '%cache-write%' THEN cost ELSE 0 END), 4)  AS cache_write_spend,
+          -- Token counts: CAST the double SUM to BIGINT so the value is
+          -- a clean integer at source. amt (line_item_usage_amount) is
+          -- a double, and an unrounded SUM renders as a float artifact
+          -- (e.g. 0.08399999999999999). The worker floors it the same
+          -- way (cur_spend_sync int(float(...))) — a token count is a
+          -- whole number.
+          CAST(SUM(CASE WHEN ut LIKE '%cache%' THEN 0
+                        WHEN ut LIKE '%input-token%' THEN amt ELSE 0 END)
+               AS BIGINT)                                              AS input_tokens,
+          CAST(SUM(CASE WHEN ut LIKE '%output-token%' THEN amt ELSE 0 END)
+               AS BIGINT)                                              AS output_tokens,
+          CAST(SUM(CASE WHEN ut LIKE '%cache-read%'  THEN amt ELSE 0 END)
+               AS BIGINT)                                              AS cache_read_tokens,
+          CAST(SUM(CASE WHEN ut LIKE '%cache-write%' THEN amt ELSE 0 END)
+               AS BIGINT)                                              AS cache_write_tokens
+        FROM base
+        GROUP BY 1, 2
+        ORDER BY 3 DESC;
+
+  SavedQueryDailyTrend:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: tg-bedrock-daily-trend
+      Description: Daily Bedrock spend for the last 30 days
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkgroup
+      QueryString: !Sub |
+        -- Daily spend trend — last 30 days.
+        SELECT
+          line_item_usage_start_date                    AS day,
+          ROUND(SUM(line_item_unblended_cost), 4)       AS actual_usd,
+          COUNT(DISTINCT line_item_iam_principal)     AS unique_users
+        FROM "${GlueDatabaseName}"."${CurTableName}"
+        WHERE line_item_product_code = 'AmazonBedrockService'
+          AND line_item_usage_start_date >= CURRENT_DATE - INTERVAL '30' DAY
+        GROUP BY 1
+        ORDER BY 1;
+
+  SavedQueryTopSpenders:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: tg-bedrock-top-spenders
+      Description: Top 20 users by Bedrock spend, current month-to-date
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkgroup
+      QueryString: !Sub |
+        -- Top 20 spenders, month-to-date.
+        SELECT
+          REGEXP_EXTRACT(line_item_iam_principal, '/([^/]+)$', 1) AS email,
+          ROUND(SUM(line_item_unblended_cost), 4)                    AS actual_usd,
+          COUNT(*)                                                   AS line_items
+        FROM "${GlueDatabaseName}"."${CurTableName}"
+        WHERE line_item_product_code = 'AmazonBedrockService'
+          AND line_item_iam_principal IS NOT NULL
+          AND {{DATE_FILTER}}
+        GROUP BY 1
+        ORDER BY 2 DESC
+        LIMIT 20;
+
+  SavedQueryMonthlyHistory:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: tg-bedrock-monthly-history
+      Description: Month-over-month Bedrock spend for the last 6 months
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkgroup
+      QueryString: !Sub |
+        -- Month-over-month spend, last 6 months.
+        SELECT
+          DATE_FORMAT(bill_billing_period_start_date, '%Y-%m')  AS month,
+          ROUND(SUM(line_item_unblended_cost), 4)               AS actual_usd,
+          COUNT(DISTINCT line_item_iam_principal)             AS unique_users
+        FROM "${GlueDatabaseName}"."${CurTableName}"
+        WHERE line_item_product_code = 'AmazonBedrockService'
+          AND bill_billing_period_start_date >= DATE_TRUNC('month',
+                CURRENT_DATE - INTERVAL '5' MONTH)
+        GROUP BY 1
+        ORDER BY 1;
+
+  # ── No role-specific Athena grant here ─────────────────────────────────
+  # #591 (#566D): AdminRoleCurAccess (the tg-cur-athena-access
+  # inline policy on tg-BedrockAdmin) is removed with the role.
+  # The desktop client that assumed tg-BedrockAdmin is gone
+  # (#574/#576). #590 (#566C): the api queries CUR under its own
+  # task role (tg-app, cfn/tg-container-stack.yaml), which carries
+  # the Athena/Glue/S3 query perms inline. No CUR grant remains here.
+
+Outputs:
+  CurBucketName:
+    Value: !Ref CurBucket
+    Export: { Name: !Sub '${AWS::StackName}-CurBucketName' }
+  AthenaResultsBucketName:
+    Value: !Ref AthenaResultsBucket
+    Export: { Name: !Sub '${AWS::StackName}-AthenaResultsBucketName' }
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+    Export: { Name: !Sub '${AWS::StackName}-GlueDatabaseName' }
+  CurTableName:
+    Value: !Ref CurTableName
+    Export: { Name: !Sub '${AWS::StackName}-CurTableName' }
+  AthenaWorkgroupName:
+    Value: !Ref AthenaWorkgroup
+    Export: { Name: !Sub '${AWS::StackName}-AthenaWorkgroupName' }
+  # #591: GlueCrawlerName output removed with the crawler.
+  CurExportName:
+    Value: !Ref ExportName
+  CcAdminEnvVars:
+    Description: Export these on the admin laptop running tg-admin
+    Value: !Sub |
+      export CC_CUR_S3_BUCKET=${CurBucket}
+      export CC_ATHENA_WORKGROUP=${AthenaWorkgroupName}
+      export CC_ATHENA_DATABASE=${GlueDatabase}

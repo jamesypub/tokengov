@@ -1,0 +1,58 @@
+# tg-admin TLS terminator — example Caddyfile for #128.
+#
+# Copy to ./caddy/Caddyfile and fill in the two placeholders
+# before running the `tls` compose profile:
+#
+#   docker compose --profile tls up -d caddy
+#
+# Caddy auto-issues a Let's Encrypt cert on first start and
+# renews ~30 days before expiry. No certbot, no cron jobs.
+#
+# Prereqs (must be done first, see docs/admin-tls.md):
+#   1. DNS A record for HOSTNAME → this EC2's public IP
+#   2. EC2 security group: 80 + 443 open to 0.0.0.0/0
+#      (port 80 is required for the ACME HTTP-01 challenge —
+#      Caddy redirects it to 443 once the cert is issued)
+#   3. EMAIL is the ACME contact (Let's Encrypt notices land here)
+
+{
+    # Global options.
+    email EMAIL
+
+    # Uncomment to use Let's Encrypt staging while debugging
+    # (rate limits are much looser; certs aren't browser-trusted).
+    # acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+HOSTNAME {
+    # Reverse-proxy everything to the api container on the
+    # internal docker network. The api stays on port 8000;
+    # we never expose it publicly.
+    reverse_proxy api:8000
+
+    # Belt-and-suspenders headers — Caddy serves HTTPS by
+    # default but explicit HSTS makes downgrade attacks fail.
+    header {
+        Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # Remove the upstream Server header.
+        -Server
+    }
+
+    # Access log — useful for diagnosing 502s during initial
+    # cutover. Comment out once the deploy is stable to keep
+    # disk use bounded.
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+        format json
+    }
+}
+
+# Plain-HTTP requests automatically get a 301 to https by
+# Caddy's default site-block handling, so no extra block
+# is needed for that.
